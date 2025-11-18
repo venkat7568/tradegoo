@@ -578,15 +578,20 @@ class PositionMonitor:
             return {"error": str(e)}
 
 
-# Global instance
+# Global instance with thread-safety
+import threading
 _monitor_instance: Optional[PositionMonitor] = None
+_monitor_lock = threading.Lock()
 
 
 def get_position_monitor() -> PositionMonitor:
-    """Get global position monitor instance."""
+    """Get global position monitor instance (thread-safe)."""
     global _monitor_instance
     if _monitor_instance is None:
-        _monitor_instance = PositionMonitor()
+        with _monitor_lock:
+            # Double-check locking pattern
+            if _monitor_instance is None:
+                _monitor_instance = PositionMonitor()
     return _monitor_instance
 
 

@@ -67,10 +67,38 @@ NEWS = NewsClient()
 TECH = UpstoxTechnicalClient()
 OP = UpstoxOperator()
 
-# ---- tiny in-memory caches & debounce state ----
-_SNAP_CACHE: Dict[Tuple[str, int], Tuple[float, dict]] = {}             # (symbol, days) -> (ts, snapshot)
-_NEWS_CACHE: Dict[Tuple[int, int, bool, str], Tuple[float, dict]] = {}  # (lookback_days, max_items, compact, mode)
-_LAST_CALL_TS: Dict[str, int] = {}                                      # per-key debounce ms timestamp
+# ---- bounded in-memory caches with LRU eviction ----
+from collections import OrderedDict
+import threading
+
+class BoundedCache:
+    """Thread-safe bounded cache with LRU eviction."""
+    def __init__(self, maxsize=100):
+        self.maxsize = maxsize
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            return None
+
+    def set(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                # Update and move to end
+                self.cache.move_to_end(key)
+            self.cache[key] = value
+            # Evict oldest if over maxsize
+            if len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
+
+_SNAP_CACHE = BoundedCache(maxsize=100)  # Limit to 100 snapshots
+_NEWS_CACHE = BoundedCache(maxsize=50)   # Limit to 50 news cache entries
+_LAST_CALL_TS: Dict[str, int] = {}       # per-key debounce ms timestamp (kept small by design)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +291,7 @@ def get_recent_news_tool(input_str=None, **kw) -> str:
             if ok:
                 items = items_or_err or []
                 payload = {"items": items}
-                _NEWS_CACHE[ck] = (now, payload)
+                _NEWS_CACHE.set(ck, (now, payload))
                 logger.info("get_recent_news_tool fetched %d items (mi=%s)", len(items), mi)
                 return _json_ok(items=items, count=len(items))
             last_err = items_or_err
@@ -386,7 +414,7 @@ def get_technical_snapshot_tool(input_str=None, **kw) -> str:
             logger.error("get_technical_snapshot_tool failed: %s", snap_or_err)
             return _json_fail("technical_failed", detail=str(snap_or_err))
 
-        _SNAP_CACHE[key] = (now, snap_or_err or {})
+        _SNAP_CACHE.set(key, (now, snap_or_err or {}))
         logger.info("get_technical_snapshot_tool fetched fresh snapshot for %s", symbol)
         return _json_ok(symbol=symbol, snapshot=snap_or_err or {})
     except Exception as e:

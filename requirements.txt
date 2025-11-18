@@ -1,0 +1,22 @@
+# AI and LLM dependencies
+crewai>=0.28.0
+langchain-openai>=0.1.0
+openai>=1.0.0
+
+# Web framework
+flask>=3.0.0
+werkzeug>=3.0.0
+
+# HTTP client
+requests>=2.31.0
+urllib3>=2.0.0
+
+# Environment configuration
+python-dotenv>=1.0.0
+
+# Date/time handling (Python 3.11+ has zoneinfo built-in, but for compatibility)
+tzdata>=2024.1
+
+# Development and testing
+pytest>=7.4.0
+pytest-cov>=4.1.0

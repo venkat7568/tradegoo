@@ -25,6 +25,7 @@ load_dotenv()
 from trading_crew import TradingCrew
 import logging
 import logging.handlers
+import sys
 
 # ============================================================================
 # LOGGING CONFIGURATION - Comprehensive logging to console + file
@@ -88,14 +89,79 @@ except Exception:
 IST = ZoneInfo("Asia/Kolkata")
 DATA_DIR = Path("./data"); DATA_DIR.mkdir(exist_ok=True)
 
+# ============================================================================
+# ENVIRONMENT VALIDATION - Check required variables at startup
+# ============================================================================
+def validate_environment():
+    """Validate all required environment variables at startup."""
+    errors = []
+    warnings = []
+
+    # Required for AI functionality
+    if not os.environ.get("OPENAI_API_KEY"):
+        errors.append("OPENAI_API_KEY is not set - AI agents will not function")
+
+    # Required for live trading
+    upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not upstox_token:
+        warnings.append("UPSTOX_ACCESS_TOKEN is not set - live trading will be disabled")
+
+    # Validate numeric environment variables
+    try:
+        max_symbols = int(os.environ.get("MAX_DISCOVERED_SYMBOLS", "20"))
+        if max_symbols < 1 or max_symbols > 100:
+            warnings.append(f"MAX_DISCOVERED_SYMBOLS={max_symbols} is out of recommended range (1-100)")
+    except ValueError:
+        errors.append("MAX_DISCOVERED_SYMBOLS must be a valid integer")
+
+    # Validate MODE if set
+    mode = os.environ.get("MODE", "live").lower()
+    if mode not in ("live", "backtest", "paper"):
+        warnings.append(f"MODE={mode} is not recognized (use: live, backtest, paper)")
+
+    # Check for deprecated/insecure settings
+    if os.environ.get("ALLOW_INSECURE_SSL"):
+        errors.append("ALLOW_INSECURE_SSL is no longer supported - SSL verification is always enabled")
+
+    return errors, warnings
+
+# Run validation
+env_errors, env_warnings = validate_environment()
+
+if env_errors:
+    print("\n" + "="*70)
+    print("❌ ENVIRONMENT VALIDATION ERRORS:")
+    for error in env_errors:
+        print(f"  • {error}")
+    print("="*70)
+    print("\nPlease fix the above errors before starting the application.")
+    print("Exiting...")
+    sys.exit(1)
+
+if env_warnings:
+    print("\n" + "="*70)
+    print("⚠️  ENVIRONMENT VALIDATION WARNINGS:")
+    for warning in env_warnings:
+        print(f"  • {warning}")
+    print("="*70 + "\n")
+
 # Max number of different symbols we’ll trade per cycle (NOT a restriction by name)
 MAX_DISCOVERED_SYMBOLS = int(os.environ.get("MAX_DISCOVERED_SYMBOLS", "20"))
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'trading-secret-2024')
+# SECURITY: Flask SECRET_KEY must be set in environment - no hardcoded default
+flask_secret = os.environ.get('FLASK_SECRET_KEY')
+if not flask_secret:
+    import secrets
+    flask_secret = secrets.token_hex(32)
+    trade_logger.warning("⚠️  FLASK_SECRET_KEY not set - generated temporary key. Sessions will be invalidated on restart.")
+    trade_logger.warning("⚠️  Set FLASK_SECRET_KEY environment variable for production!")
+app.config['SECRET_KEY'] = flask_secret
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+# SECURITY: Protect global state with threading lock to prevent race conditions
 trading_active = False
+trading_lock = threading.Lock()
 status_queue = queue.Queue()
 current_companies_data = []  # Track companies being analyzed
 
@@ -610,7 +676,8 @@ def discover_and_validate_symbols(mode, date, max_symbols=20):
 def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
     global trading_active, current_companies_data
     try:
-        trading_active = True
+        with trading_lock:
+            trading_active = True
         emit_status(f"🚀 Trading system started (mode={mode}, date={date}, live={'ON' if live else 'OFF'})")
         emit_status(f"⚙️ Settings: max_symbols={max_symbols}, learning={'ON' if learning_mode else 'OFF'}")
 
@@ -621,7 +688,8 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
                 if not status.get("open"):
                     emit_status("⏳ Market closed, waiting for open...")
                     while not operator.market_session_status().get("open"):
-                        if not trading_active: return
+                        with trading_lock:
+                            if not trading_active: return
                         time.sleep(30)
                     emit_status("✅ Market opened!")
             except Exception as e:
@@ -688,7 +756,8 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
     except Exception as e:
         emit_status(f"❌ System error: {str(e)}")
     finally:
-        trading_active = False
+        with trading_lock:
+            trading_active = False
         current_companies_data = []  # Clear on stop
         emit_status("⏹️ System stopped")
 
@@ -746,8 +815,9 @@ def get_status():
 @app.route("/start", methods=["POST"])
 def start_trading():
     global trading_active
-    if trading_active:
-        return jsonify({"status": "error", "message": "Already running"})
+    with trading_lock:
+        if trading_active:
+            return jsonify({"status": "error", "message": "Already running"})
     data = request.json or {}
     mode = data.get("mode", "live")
     date = data.get("date")
@@ -760,7 +830,8 @@ def start_trading():
 @app.route("/stop", methods=["POST"])
 def stop_trading():
     global trading_active
-    trading_active = False
+    with trading_lock:
+        trading_active = False
     return jsonify({"status": "ok"})
 
 @app.route("/learning", methods=["POST"])

@@ -460,15 +460,20 @@ class TradeTracker:
         }
 
 
-# Global singleton instance
+# Global singleton instance with thread-safety
+import threading
 _tracker_instance: Optional[TradeTracker] = None
+_tracker_lock = threading.Lock()
 
 
 def get_trade_tracker() -> TradeTracker:
-    """Get the global trade tracker instance."""
+    """Get the global trade tracker instance (thread-safe)."""
     global _tracker_instance
     if _tracker_instance is None:
-        _tracker_instance = TradeTracker()
+        with _tracker_lock:
+            # Double-check locking pattern
+            if _tracker_instance is None:
+                _tracker_instance = TradeTracker()
     return _tracker_instance
 
 

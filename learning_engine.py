@@ -567,15 +567,20 @@ class LearningEngine:
         }
 
 
-# Global instance
+# Global instance with thread-safety
+import threading
 _learning_engine_instance: Optional[LearningEngine] = None
+_learning_engine_lock = threading.Lock()
 
 
 def get_learning_engine() -> LearningEngine:
-    """Get global learning engine instance."""
+    """Get global learning engine instance (thread-safe)."""
     global _learning_engine_instance
     if _learning_engine_instance is None:
-        _learning_engine_instance = LearningEngine()
+        with _learning_engine_lock:
+            # Double-check locking pattern
+            if _learning_engine_instance is None:
+                _learning_engine_instance = LearningEngine()
     return _learning_engine_instance
 
 

@@ -484,15 +484,20 @@ class MoneyManager:
         }
 
 
-# Global instance
+# Global instance with thread-safety
+import threading
 _money_manager_instance: Optional[MoneyManager] = None
+_money_manager_lock = threading.Lock()
 
 
 def get_money_manager() -> MoneyManager:
-    """Get global money manager instance."""
+    """Get global money manager instance (thread-safe)."""
     global _money_manager_instance
     if _money_manager_instance is None:
-        _money_manager_instance = MoneyManager()
+        with _money_manager_lock:
+            # Double-check locking pattern
+            if _money_manager_instance is None:
+                _money_manager_instance = MoneyManager()
     return _money_manager_instance
 
 
