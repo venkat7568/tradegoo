@@ -577,8 +577,11 @@ def calculate_max_quantity_tool(input_str: Any = None, **kw) -> str:
                 return _json_ok(**resp) if resp.get("ok", True) else _json_fail("calc_max_qty_failed", **resp)
             return _json_ok(result=resp)
 
-        # Fallback estimator
-        leverage = 3.0 if str(product).upper().startswith("I") else 1.0
+        # FIXED: Make leverage configurable instead of hardcoded
+        # Different brokers and instruments have different leverage amounts
+        default_intraday_leverage = float(os.environ.get("INTRADAY_LEVERAGE", "3.0"))
+        default_delivery_leverage = float(os.environ.get("DELIVERY_LEVERAGE", "1.0"))
+        leverage = default_intraday_leverage if str(product).upper().startswith("I") else default_delivery_leverage
         gross_budget = max(0.0, available * leverage)
         max_qty_by_budget = int(math.floor(gross_budget / price)) if price > 0 else 0
 

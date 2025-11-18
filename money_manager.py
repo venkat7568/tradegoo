@@ -76,10 +76,18 @@ class MoneyManager:
             except Exception as e:
                 logger.error(f"Error loading config: {e}")
 
+        # FIXED: Warn loudly about using default capital - this should be configured!
+        logger.warning("=" * 80)
+        logger.warning("⚠️  USING DEFAULT MONEY MANAGEMENT CONFIG")
+        logger.warning("⚠️  Please create config file with your actual capital amounts:")
+        logger.warning(f"⚠️  {self.config_file}")
+        logger.warning("⚠️  Default total_capital = 100000.0 (This may not match your account!)")
+        logger.warning("=" * 80)
+
         # Default configuration
         return {
             # Capital allocation
-            "total_capital": 100000.0,  # Total capital in account
+            "total_capital": 100000.0,  # PLACEHOLDER - Configure your actual capital!
             "intraday_allocation_pct": 40.0,  # % allocated to intraday
             "swing_allocation_pct": 60.0,  # % allocated to swing
 
@@ -176,9 +184,13 @@ class MoneyManager:
                 available_capital = float(equity.get("available_margin", 0) or 0)
                 used_capital = float(equity.get("used_margin", 0) or 0)
             except Exception as e:
-                logger.error(f"Error fetching funds: {e}")
-                # Fallback to config
-                available_capital = self.config["total_capital"]
+                logger.error(f"🚨 CRITICAL: Error fetching funds from broker: {e}")
+                logger.error(f"   Cannot trade without real-time capital data!")
+                # FIXED: Do NOT fallback to stale config data - raise error instead
+                raise RuntimeError(
+                    f"Cannot fetch real-time capital from broker. "
+                    f"Trading is unsafe without accurate capital data. Error: {e}"
+                )
 
         total_capital = available_capital + used_capital
 

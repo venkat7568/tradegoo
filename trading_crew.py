@@ -145,9 +145,18 @@ class TradingCrew:
 
         try:
             self.operator = UpstoxOperator() if UpstoxOperator else None
-            print("✅ Operator initialized" if self.operator else "⚠️ Operator not available")
+            if self.operator:
+                print("✅ Operator initialized")
+            else:
+                print("⚠️ Operator not available")
+                # FIXED: Fail fast in live mode if operator not available
+                if self.live:
+                    raise RuntimeError("Cannot run in LIVE mode without operator - trading would fail!")
         except Exception as e:
-            print(f"⚠️ Operator init failed: {e}")
+            print(f"🚨 Operator init failed: {e}")
+            # FIXED: Fail fast in live mode
+            if self.live:
+                raise RuntimeError(f"Cannot run in LIVE mode without operator! Error: {e}")
             self.operator = None
 
         # Initialize trade tracker for P&L tracking
@@ -431,13 +440,18 @@ Return JSON only:
     # -------------------------------
     def square_off_intraday_positions(self) -> List[Dict[str, Any]]:
         """
-        Square off all intraday positions before market close (3:15 PM IST).
-        Call this method during the trading session if current time > 3:10 PM.
+        Square off all intraday positions before market close.
+        Default time: 3:10 PM IST (configurable via INTRADAY_SQUARE_OFF_TIME env var)
+        Call this method during the trading session after the square-off time.
         """
         now = datetime.now(IST)
-        square_off_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
 
-        # Only square off after 3:10 PM
+        # FIXED: Make square-off time configurable (default 3:10 PM)
+        square_off_hour = int(os.environ.get("INTRADAY_SQUARE_OFF_HOUR", "15"))
+        square_off_minute = int(os.environ.get("INTRADAY_SQUARE_OFF_MINUTE", "10"))
+        square_off_time = now.replace(hour=square_off_hour, minute=square_off_minute, second=0, microsecond=0)
+
+        # Only square off after configured time
         if now < square_off_time:
             return []
 
@@ -681,7 +695,14 @@ Return JSON only (include style!):
         result = str(crew.kickoff()).strip()
 
         try:
-            parsed = json.loads(result) if result.startswith("{") else {}
+            # Try to extract JSON from result
+            if "{" in result:
+                json_start = result.find("{")
+                json_end = result.rfind("}") + 1
+                if json_end > json_start:
+                    result = result[json_start:json_end]
+
+            parsed = json.loads(result)
             direction = (parsed.get("direction") or "SKIP").upper()
             conf = parsed.get("confidence", None)
 
@@ -696,18 +717,48 @@ Return JSON only (include style!):
             return decision
 
         except Exception as e:
+            # FIXED: Try to extract decision from text before giving up
+            print(f"⚠️ Could not parse decision JSON, attempting text extraction...")
+            print(f"   Raw result: {result[:200]}...")
+
+            direction = "SKIP"
+            confidence = None
+
+            # Try to extract direction from text
+            result_upper = result.upper()
+            if "BUY" in result_upper and "SELL" not in result_upper:
+                direction = "BUY"
+                print(f"   Extracted direction: BUY from text")
+            elif "SELL" in result_upper and "BUY" not in result_upper:
+                direction = "SELL"
+                print(f"   Extracted direction: SELL from text")
+
+            # Try to extract confidence (look for numbers between 0 and 1)
+            import re
+            conf_match = re.search(r'confidence["\s:]*([0-9.]+)', result, re.IGNORECASE)
+            if conf_match:
+                try:
+                    confidence = float(conf_match.group(1))
+                    print(f"   Extracted confidence: {confidence}")
+                except:
+                    pass
+
             self._log_incident(
                 {
                     "type": "decision_parse_error",
                     "symbol": symbol,
                     "error": str(e),
                     "raw_result": result,
+                    "extracted_direction": direction,
+                    "extracted_confidence": confidence,
                 }
             )
             decision = {
                 "symbol": symbol,
-                "direction": "SKIP",
-                "reason": "parse_error",
+                "direction": direction,
+                "confidence": confidence,
+                "reason": "parse_error_with_extraction" if direction != "SKIP" else "parse_error",
+                "raw": result,
                 "timestamp": datetime.now(IST).isoformat(),
             }
             self._emit_status("decide_complete", decision)
@@ -813,24 +864,17 @@ Return ONLY this JSON (NO arrays, NO nested objects):
             try:
                 entry_validation = json.loads(entry_result_str)
             except json.JSONDecodeError:
-                # CHANGED: Default to ENTER_NOW if JSON is malformed (trust the decision agent)
-                print(f"⚠️ Entry validation malformed JSON, trusting decision agent (confidence={confidence:.2f})")
+                # FIXED: Default to SKIP on validator failure - safety first!
+                print(f"⚠️ Entry validation malformed JSON, defaulting to SKIP for safety")
                 entry_validation = {
-                    "entry_decision": "ENTER_NOW",
-                    "entry_quality_score": 65,
-                    "reason": "Validator failed, trusting decision agent"
+                    "entry_decision": "SKIP",
+                    "entry_quality_score": 0,
+                    "reason": "Validator failed - cannot assess entry quality safely"
                 }
 
-            entry_decision = (entry_validation.get("entry_decision") or "ENTER_NOW").upper()
-            entry_quality = int(entry_validation.get("entry_quality_score") or 65)
+            entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
+            entry_quality = int(entry_validation.get("entry_quality_score") or 0)
             entry_reason = entry_validation.get("reason", "")
-
-            # SAFETY: If validator returns 0 score but decision agent had good confidence, override to ENTER_NOW
-            if entry_quality == 0 and confidence >= 0.60:
-                print(f"⚠️ Overriding 0 score: decision confidence {confidence:.2f} >= 0.60, allowing entry")
-                entry_decision = "ENTER_NOW"
-                entry_quality = 65
-                entry_reason = "Overridden: trusting decision agent confidence"
 
             print(f"📊 Entry Quality: {entry_quality}/100 → {entry_decision}")
             print(f"   Reason: {entry_reason}")
@@ -983,15 +1027,26 @@ IMPORTANT:
                 "reason": plan_obj.get("reason", "infeasible"),
             }
 
-        # Unwrap possible nested plan structures: {"final_choice": {...}} / {"plan": {...}} etc.
+        # FIXED: Validate risk plan structure more strictly
+        # Risk agent should return flat JSON with: qty, entry, stop_loss, target, etc.
+        # If it's nested, try to unwrap but log a warning
         chosen = None
-        for key in ("final_choice", "plan", "intraday", "swing"):
-            v = plan_obj.get(key)
-            if isinstance(v, dict):
-                chosen = v
-                break
-        if chosen is None:
-            chosen = plan_obj  # assume flat
+
+        # First check if it's a flat structure with required fields
+        if "qty" in plan_obj or "entry" in plan_obj:
+            chosen = plan_obj  # Flat structure - preferred format
+        else:
+            # Try to unwrap nested structures (but log warning)
+            for key in ("final_choice", "plan", "intraday", "swing"):
+                v = plan_obj.get(key)
+                if isinstance(v, dict):
+                    print(f"⚠️ Risk agent returned nested structure under '{key}' - please fix agent to return flat JSON")
+                    chosen = v
+                    break
+
+            if chosen is None:
+                print(f"⚠️ Risk agent returned unexpected structure, treating as flat")
+                chosen = plan_obj
 
         # Ensure basic fields (also provide 'side' alias for executor)
         chosen.setdefault("symbol", symbol)
@@ -1023,6 +1078,28 @@ IMPORTANT:
                 "status": "skipped",
                 "reason": "invalid_risk_plan",
             }
+
+        # FIXED: Validate SL is in correct direction relative to entry price
+        if stop_loss is not None and _is_num(stop_loss):
+            entry_price = float(entry)
+            sl_price = float(stop_loss)
+
+            if direction == "BUY" and sl_price >= entry_price:
+                print(f"⚠️ Invalid SL for BUY: stop_loss ({sl_price}) must be < entry ({entry_price})")
+                return {
+                    "symbol": symbol,
+                    "status": "skipped",
+                    "reason": "invalid_stop_loss_direction",
+                    "detail": f"BUY stop_loss {sl_price} >= entry {entry_price}"
+                }
+            elif direction == "SELL" and sl_price <= entry_price:
+                print(f"⚠️ Invalid SL for SELL: stop_loss ({sl_price}) must be > entry ({entry_price})")
+                return {
+                    "symbol": symbol,
+                    "status": "skipped",
+                    "reason": "invalid_stop_loss_direction",
+                    "detail": f"SELL stop_loss {sl_price} <= entry {entry_price}"
+                }
 
         # Clean plan JSON that we pass to executor
         cleaned_plan_str = json.dumps(chosen, ensure_ascii=False)
@@ -1082,21 +1159,25 @@ Return only JSON like:
                     exec_json_str = exec_result[json_start:json_end]
                     exec_data = json.loads(exec_json_str)
         except Exception as e:
-            print(f"⚠️ Could not parse execution result for trade tracking: {e}")
+            print(f"⚠️ Could not parse execution result JSON: {e}")
 
-        # Record trade entry in tracker if successful
+        # FIXED: Record trade entry in tracker using plan data (don't depend on exec_data parsing)
+        # This ensures position is tracked even if execution result JSON parsing fails
         trade_record = None
-        if self.tracker and exec_data and exec_data.get("status") in ("success", "ok"):
+        if self.tracker:
             try:
-                # Extract order details
-                order_info = exec_data.get("order") or exec_data.get("entry") or {}
-                order_id = order_info.get("order_id")
-
-                # Get entry price from chosen plan
+                # Get all required data from the plan (chosen) - we already have this!
                 entry_price = float(chosen.get("entry", 0))
                 stop_loss = float(chosen.get("stop_loss") or 0) if chosen.get("stop_loss") else None
                 target = float(chosen.get("target") or 0) if chosen.get("target") else None
 
+                # Try to get order_id from exec_data if available, otherwise None
+                order_id = None
+                if exec_data:
+                    order_info = exec_data.get("order") or exec_data.get("entry") or {}
+                    order_id = order_info.get("order_id")
+
+                # Record entry if we have valid data
                 if entry_price > 0 and qty > 0:
                     trade_record = self.tracker.record_entry(
                         symbol=symbol,
@@ -1115,9 +1196,15 @@ Return only JSON like:
                             "rr_ratio": chosen.get("rr_ratio"),
                         }
                     )
-                    print(f"📊 Trade recorded in tracker: {trade_record.get('trade_id')}")
+                    print(f"✅ Trade recorded in tracker: {trade_record.get('trade_id')}")
+                else:
+                    print(f"⚠️ Cannot track trade: invalid entry_price={entry_price} or qty={qty}")
             except Exception as e:
-                print(f"⚠️ Error recording trade entry: {e}")
+                # CRITICAL: If tracking fails, log loudly - this is a serious problem!
+                print(f"🚨 CRITICAL ERROR recording trade entry: {e}")
+                print(f"   Position may be open but UNTRACKED - check manually!")
+                import traceback
+                traceback.print_exc()
 
         result = {
             "symbol": symbol,

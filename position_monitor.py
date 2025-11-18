@@ -248,7 +248,26 @@ class PositionMonitor:
                     # Check if we have tracking info for this position
                     tracked = tracked_positions.get(symbol)
                     if not tracked:
-                        logger.warning(f"Position {symbol} not found in tracker - cannot check SL/target")
+                        logger.error(f"🚨 CRITICAL: Position {symbol} not found in tracker - UNMONITORED POSITION!")
+                        logger.error(f"   This position has NO stop-loss protection. Closing immediately for safety.")
+                        # FIXED: Immediately close untracked positions - they have no SL/target protection!
+                        try:
+                            square_off_result = self.operator.square_off_position(symbol, product=product)
+                            logger.info(f"✅ Emergency square-off of untracked position {symbol}: {square_off_result}")
+                            reviews.append({
+                                "symbol": symbol,
+                                "status": "emergency_exit",
+                                "reason": "position_not_tracked",
+                                "action": "squared_off_immediately"
+                            })
+                        except Exception as e:
+                            logger.error(f"❌ Failed to square off untracked position {symbol}: {e}")
+                            reviews.append({
+                                "symbol": symbol,
+                                "status": "error",
+                                "reason": "untracked_position_cannot_close",
+                                "error": str(e)
+                            })
                         continue
 
                     # Get SL and target from tracked position
@@ -261,27 +280,36 @@ class PositionMonitor:
                     exit_reason = None
                     should_exit = False
 
-                    # Check stop-loss
-                    if stop_loss:
-                        if side == "BUY" and current_price <= stop_loss:
-                            exit_reason = "STOP_LOSS_HIT"
-                            should_exit = True
-                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} <= {stop_loss:.2f}")
-                        elif side == "SELL" and current_price >= stop_loss:
-                            exit_reason = "STOP_LOSS_HIT"
-                            should_exit = True
-                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} >= {stop_loss:.2f}")
+                    # FIXED: Add slippage tolerance (0.1%) to handle price gaps and market volatility
+                    SLIPPAGE_TOLERANCE = 0.001  # 0.1% tolerance
 
-                    # Check target
+                    # Check stop-loss (with tolerance to catch gaps)
+                    if stop_loss:
+                        sl_threshold_buy = stop_loss * (1 + SLIPPAGE_TOLERANCE)
+                        sl_threshold_sell = stop_loss * (1 - SLIPPAGE_TOLERANCE)
+
+                        if side == "BUY" and current_price <= sl_threshold_buy:
+                            exit_reason = "STOP_LOSS_HIT"
+                            should_exit = True
+                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} <= {stop_loss:.2f} (tolerance: {sl_threshold_buy:.2f})")
+                        elif side == "SELL" and current_price >= sl_threshold_sell:
+                            exit_reason = "STOP_LOSS_HIT"
+                            should_exit = True
+                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} >= {stop_loss:.2f} (tolerance: {sl_threshold_sell:.2f})")
+
+                    # Check target (with tolerance to ensure we capture target hits)
                     if not should_exit and target:
-                        if side == "BUY" and current_price >= target:
+                        target_threshold_buy = target * (1 - SLIPPAGE_TOLERANCE)
+                        target_threshold_sell = target * (1 + SLIPPAGE_TOLERANCE)
+
+                        if side == "BUY" and current_price >= target_threshold_buy:
                             exit_reason = "TARGET_HIT"
                             should_exit = True
-                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} >= {target:.2f}")
-                        elif side == "SELL" and current_price <= target:
+                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} >= {target:.2f} (tolerance: {target_threshold_buy:.2f})")
+                        elif side == "SELL" and current_price <= target_threshold_sell:
                             exit_reason = "TARGET_HIT"
                             should_exit = True
-                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} <= {target:.2f}")
+                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} <= {target:.2f} (tolerance: {target_threshold_sell:.2f})")
 
                     # Check time-based exit for intraday (after 3:15 PM)
                     if not should_exit and product == "I":
@@ -318,23 +346,37 @@ class PositionMonitor:
                                 if square_off_result.get("status") == "ok":
                                     logger.info(f"✅ {symbol} squared off successfully")
 
-                                    # Record exit in tracker
+                                    # FIXED: Record exit in tracker with retry logic
                                     if self.tracker:
-                                        try:
-                                            pnl_record = self.tracker.record_exit(
-                                                symbol=symbol,
-                                                exit_price=current_price,
-                                                exit_reason=exit_reason,
-                                                order_id=square_off_result.get("order_id"),
-                                            )
-                                            action_result["pnl_record"] = pnl_record
+                                        max_retries = 3
+                                        for attempt in range(max_retries):
+                                            try:
+                                                pnl_record = self.tracker.record_exit(
+                                                    symbol=symbol,
+                                                    exit_price=current_price,
+                                                    exit_reason=exit_reason,
+                                                    order_id=square_off_result.get("order_id"),
+                                                )
+                                                action_result["pnl_record"] = pnl_record
 
-                                            net_pnl = pnl_record.get("net_pnl", 0)
-                                            pnl_pct = pnl_record.get("pnl_percent", 0)
-                                            logger.info(f"💰 P&L: {symbol} → ₹{net_pnl:.2f} ({pnl_pct:+.2f}%)")
+                                                net_pnl = pnl_record.get("net_pnl", 0)
+                                                pnl_pct = pnl_record.get("pnl_percent", 0)
+                                                logger.info(f"💰 P&L: {symbol} → ₹{net_pnl:.2f} ({pnl_pct:+.2f}%)")
+                                                break  # Success, exit retry loop
 
-                                        except Exception as e:
-                                            logger.error(f"Error recording exit for {symbol}: {e}")
+                                            except Exception as e:
+                                                if attempt < max_retries - 1:
+                                                    logger.warning(f"Failed to record exit for {symbol} (attempt {attempt + 1}/{max_retries}): {e}")
+                                                    import time
+                                                    time.sleep(0.5)  # Brief pause before retry
+                                                else:
+                                                    # All retries failed - this is critical!
+                                                    logger.error(f"🚨 CRITICAL: Failed to record exit for {symbol} after {max_retries} attempts!")
+                                                    logger.error(f"   Position closed but P&L NOT tracked. Manual reconciliation needed.")
+                                                    logger.error(f"   Symbol: {symbol}, Exit Price: {current_price}, Reason: {exit_reason}")
+                                                    action_result["tracking_error"] = str(e)
+                                                    import traceback
+                                                    traceback.print_exc()
                                 else:
                                     logger.error(f"❌ Failed to square off {symbol}: {square_off_result.get('message')}")
 

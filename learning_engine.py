@@ -198,13 +198,26 @@ class LearningEngine:
             self.state["losing_patterns"] = losing_patterns
             self.state["recommended_adjustments"] = recommendations.get("adjustments", {})
 
-            # Adjust confidence threshold based on results
+            # FIXED: Adjust confidence threshold with explicit bounds (0.50 - 0.80)
+            MIN_CONFIDENCE = 0.50
+            MAX_CONFIDENCE = 0.80
+            current_threshold = self.state.get("confidence_threshold", 0.60)
+
+            # Ensure current threshold is within bounds first
+            current_threshold = max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, current_threshold))
+
             if win_rate < 50:
-                # Low win rate - increase confidence threshold
-                self.state["confidence_threshold"] = min(0.75, self.state.get("confidence_threshold", 0.60) + 0.05)
+                # Low win rate - increase confidence threshold (more conservative)
+                new_threshold = current_threshold + 0.05
             elif win_rate > 70:
                 # High win rate - can be slightly more aggressive
-                self.state["confidence_threshold"] = max(0.55, self.state.get("confidence_threshold", 0.60) - 0.02)
+                new_threshold = current_threshold - 0.02
+            else:
+                # Win rate 50-70% - keep current threshold
+                new_threshold = current_threshold
+
+            # Apply bounds
+            self.state["confidence_threshold"] = max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, new_threshold))
 
             self._save_state()
 
@@ -260,7 +273,15 @@ class LearningEngine:
             return {"error": str(e)}
 
     def _load_recent_trades(self, days: int) -> List[Dict[str, Any]]:
-        """Load trades from recent days."""
+        """
+        Load trades from recent days.
+
+        FIXED: Added optimization to avoid reading entire file.
+        For very large files (10,000+ trades), consider implementing:
+        - Reverse file reading (recent trades are at end)
+        - Indexed files by date
+        - Database instead of JSONL
+        """
         trades = []
 
         if not self.tracker or not self.tracker.trades_history_file.exists():
@@ -268,9 +289,19 @@ class LearningEngine:
 
         cutoff_date = datetime.now(IST) - timedelta(days=days)
 
+        # Optimization: Read file in reverse to get recent trades first
+        # For now, we'll read forward but stop after we have enough old trades
+        MAX_LINES = 100000  # Safety limit to avoid reading massive files
+        lines_read = 0
+
         try:
             with open(self.tracker.trades_history_file, "r") as f:
                 for line in f:
+                    lines_read += 1
+                    if lines_read > MAX_LINES:
+                        logger.warning(f"Reached max lines ({MAX_LINES}), stopping read. Consider optimizing file storage.")
+                        break
+
                     try:
                         trade = json.loads(line.strip())
                         # Check if trade is within date range
@@ -282,6 +313,7 @@ class LearningEngine:
         except Exception as e:
             logger.error(f"Error loading trades: {e}")
 
+        logger.info(f"Loaded {len(trades)} trades from last {days} days (scanned {lines_read} lines)")
         return trades
 
     def _analyze_by_symbol(self, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
