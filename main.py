@@ -608,7 +608,7 @@ def discover_and_validate_symbols(mode, date, max_symbols=20):
     return validated
 
 def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
-    global trading_active
+    global trading_active, current_companies_data
     try:
         trading_active = True
         emit_status(f"🚀 Trading system started (mode={mode}, date={date}, live={'ON' if live else 'OFF'})")
@@ -648,7 +648,6 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
         symbols_to_trade = [s["symbol"] for s in validated_symbols]
 
         # Update companies being analyzed for UI
-        global current_companies_data
         current_companies_data = [{"symbol": s["symbol"], "name": s.get("name", s["symbol"]), "decision": None} for s in validated_symbols]
 
         try:
@@ -690,7 +689,6 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
         emit_status(f"❌ System error: {str(e)}")
     finally:
         trading_active = False
-        global current_companies_data
         current_companies_data = []  # Clear on stop
         emit_status("⏹️ System stopped")
 
