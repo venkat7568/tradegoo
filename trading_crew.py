@@ -633,17 +633,17 @@ CRITICAL SCORING CRITERIA:
    - Best windows (9:20-9:45, 10:30-11:30): +10 pts
    - Other times: +5 pts
 
-Return JSON:
-{
-  "entry_decision": "ENTER_NOW" | "WATCHLIST" | "SKIP",
-  "entry_quality_score": <0-100>,
-  "reason": "Brief explanation",
-  "wait_for": "pullback to 120-121" (if WATCHLIST)
-}
+CRITICAL OUTPUT FORMAT:
+Return ONLY this exact JSON (FLAT, no arrays or nested objects):
+{{
+  "entry_decision": "ENTER_NOW",
+  "entry_quality_score": 75,
+  "reason": "Brief explanation"
+}}
 
 RULES:
 - Score ≥70: ENTER_NOW
-- Score 50-69: WATCHLIST (good signal, but wait for better entry)
+- Score 50-69: WATCHLIST
 - Score <50: SKIP
 """,
             symbol=symbol,
@@ -670,9 +670,25 @@ RULES:
 
         # Parse entry validation result
         try:
-            entry_validation = (
-                json.loads(entry_result_str) if entry_result_str.lstrip().startswith("{") else {}
-            )
+            # Extract JSON from text if needed
+            if "{" in entry_result_str:
+                json_start = entry_result_str.find("{")
+                json_end = entry_result_str.rfind("}") + 1
+                if json_end > json_start:
+                    entry_result_str = entry_result_str[json_start:json_end]
+
+            # Try parsing
+            try:
+                entry_validation = json.loads(entry_result_str)
+            except json.JSONDecodeError:
+                # Default to SKIP if JSON is malformed
+                print(f"⚠️ Entry validation returned malformed JSON, defaulting to SKIP")
+                entry_validation = {
+                    "entry_decision": "SKIP",
+                    "entry_quality_score": 0,
+                    "reason": "JSON parse error"
+                }
+
             entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
             entry_quality = int(entry_validation.get("entry_quality_score") or 0)
             entry_reason = entry_validation.get("reason", "")

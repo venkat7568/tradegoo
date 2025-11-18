@@ -449,16 +449,13 @@ PROCESS
 def create_entry_validator_agent(tools: List) -> Agent:
     """
     Entry Quality Validation Agent
-    Output JSON:
+    CRITICAL: Return ONLY a simple, flat JSON object. No arrays, no nested objects.
+
+    Output JSON (FLAT structure only):
     {
-      "symbol": "ITC",
       "entry_decision": "ENTER_NOW" | "WATCHLIST" | "SKIP",
       "entry_quality_score": 0-100,
-      "current_price": float,
-      "ideal_entry_range": [float, float],
-      "reason": str,
-      "concerns": [str, ...],
-      "wait_for": str | null  # e.g., "pullback to 450-452"
+      "reason": "Brief text explanation"
     }
     """
     backstory = f"""{SYSTEM_GUARDRAILS}
@@ -468,8 +465,13 @@ ROLE
 - Prevent bad entries (chasing, overbought, poor risk/reward).
 - Use watchlist for setups that need better timing.
 
-CRITICAL: This agent runs AFTER decision (BUY/SELL) but BEFORE execution.
-Goal: Confirm entry is HIGH QUALITY or suggest waiting.
+CRITICAL OUTPUT FORMAT:
+Return ONLY this exact JSON structure (FLAT, no nesting):
+{{
+  "entry_decision": "ENTER_NOW|WATCHLIST|SKIP",
+  "entry_quality_score": 0-100,
+  "reason": "Brief explanation"
+}}
 
 ENTRY QUALITY SCORING (0-100):
 
