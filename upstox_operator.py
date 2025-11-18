@@ -521,13 +521,13 @@ class UpstoxOperator:
                     "total": float(charges.get("total", 0) or 0),
                 },
                 "product": product.upper(),
-                "leverage": 5.0 if product.upper() == "I" else 1.0,
+                "leverage": 3.0 if product.upper() == "I" else 1.0,
                 "raw": data.get("data"),
             }
         # fallback model
         if product.upper() == "I":
             req = price * qty * 0.20
-            lev = 5.0
+            lev = 3.0
         else:
             req = price * qty * 1.00
             lev = 1.0
@@ -555,7 +555,8 @@ class UpstoxOperator:
         """
         usable = max(0.0, available_margin) * max(0.0, min(1.0, safety_buffer))
         if product.upper() == "I":
-            max_qty = int(usable / (max(price, 0.01) * 0.20))
+            # 3x leverage for intraday (margin requirement ~33%)
+            max_qty = int(usable / (max(price, 0.01) * 0.33))
         else:
             max_qty = int(usable / max(price, 0.01))
         if max_qty <= 0:
