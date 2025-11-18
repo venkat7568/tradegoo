@@ -608,43 +608,29 @@ Return JSON only (include style!):
         self._emit_status("entry_validation_start", {"symbol": symbol, "direction": direction})
 
         entry_validation_desc = _tmpl(
-            """Validate entry quality for $symbol.
+            """Entry quality check for $symbol ($direction, conf=$confidence).
 
-Decision: $direction (confidence: $confidence)
-Technical Snapshot: $snapshot
+Technical Data: $snapshot
 
-Your job: Determine if RIGHT NOW is a good time to enter this trade.
-
-CRITICAL SCORING CRITERIA:
-1. Price vs Key Levels (40 pts)
-   - Near support/VWAP for BUY: +20 pts
-   - Extended >2% above VWAP: -10 pts
-   - Breakout with volume: +20 pts
-
-2. Volume (30 pts)
-   - High volume confirmation: +20 pts
-   - Volume increasing: +10 pts
-
-3. Momentum (20 pts)
-   - RSI 50-70 for BUY: +15 pts
-   - RSI >80: -10 pts (overbought)
-
-4. Timing (10 pts)
-   - Best windows (9:20-9:45, 10:30-11:30): +10 pts
-   - Other times: +5 pts
-
-Return JSON:
-{
-  "entry_decision": "ENTER_NOW" | "WATCHLIST" | "SKIP",
-  "entry_quality_score": <0-100>,
-  "reason": "Brief explanation",
-  "wait_for": "pullback to 120-121" (if WATCHLIST)
-}
+SIMPLIFIED SCORING (start at 60, trust decision agent):
+- Base: 60 points
+- RSI 40-75: +10
+- RSI >80 or <20: -20
+- Price >3% from VWAP: -10
+- Good time (9:20-11:30, 14:00-14:45): +10
+- Bad time (last 10 min): -15
 
 RULES:
-- Score ≥70: ENTER_NOW
-- Score 50-69: WATCHLIST (good signal, but wait for better entry)
-- Score <50: SKIP
+- Score ≥60: ENTER_NOW (allow trade)
+- Score 40-59: WATCHLIST
+- Score <40: SKIP
+
+Return ONLY this JSON (NO arrays, NO nested objects):
+{{
+  "entry_decision": "ENTER_NOW",
+  "entry_quality_score": 70,
+  "reason": "RSI healthy timing good"
+}}
 """,
             symbol=symbol,
             direction=direction,
@@ -670,12 +656,35 @@ RULES:
 
         # Parse entry validation result
         try:
-            entry_validation = (
-                json.loads(entry_result_str) if entry_result_str.lstrip().startswith("{") else {}
-            )
-            entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
-            entry_quality = int(entry_validation.get("entry_quality_score") or 0)
+            # Extract JSON from text if needed
+            if "{" in entry_result_str:
+                json_start = entry_result_str.find("{")
+                json_end = entry_result_str.rfind("}") + 1
+                if json_end > json_start:
+                    entry_result_str = entry_result_str[json_start:json_end]
+
+            # Try parsing
+            try:
+                entry_validation = json.loads(entry_result_str)
+            except json.JSONDecodeError:
+                # CHANGED: Default to ENTER_NOW if JSON is malformed (trust the decision agent)
+                print(f"⚠️ Entry validation malformed JSON, trusting decision agent (confidence={confidence:.2f})")
+                entry_validation = {
+                    "entry_decision": "ENTER_NOW",
+                    "entry_quality_score": 65,
+                    "reason": "Validator failed, trusting decision agent"
+                }
+
+            entry_decision = (entry_validation.get("entry_decision") or "ENTER_NOW").upper()
+            entry_quality = int(entry_validation.get("entry_quality_score") or 65)
             entry_reason = entry_validation.get("reason", "")
+
+            # SAFETY: If validator returns 0 score but decision agent had good confidence, override to ENTER_NOW
+            if entry_quality == 0 and confidence >= 0.60:
+                print(f"⚠️ Overriding 0 score: decision confidence {confidence:.2f} >= 0.60, allowing entry")
+                entry_decision = "ENTER_NOW"
+                entry_quality = 65
+                entry_reason = "Overridden: trusting decision agent confidence"
 
             print(f"📊 Entry Quality: {entry_quality}/100 → {entry_decision}")
             print(f"   Reason: {entry_reason}")

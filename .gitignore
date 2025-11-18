@@ -17,6 +17,10 @@ data/
 *.db
 *.sqlite
 
+# Cache directories
+.cache_upstox/
+.cache/
+
 # Environment
 .env
 .env.local
