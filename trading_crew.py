@@ -47,6 +47,9 @@ from crew_tools import (
 from upstox_technical import UpstoxTechnicalClient
 from news_client import NewsClient
 
+# Trade tracker for P&L calculation
+from trade_tracker import TradeTracker
+
 # Imperative operator for direct actions (optional)
 try:
     import upstox_operator as upop
@@ -134,6 +137,14 @@ class TradingCrew:
         except Exception as e:
             print(f"⚠️ Operator init failed: {e}")
             self.operator = None
+
+        # Initialize trade tracker for P&L tracking
+        try:
+            self.tracker = TradeTracker()
+            print("✅ Trade tracker initialized")
+        except Exception as e:
+            print(f"⚠️ Trade tracker init failed: {e}")
+            self.tracker = None
 
         # Initialize agents with tools
         all_tools = [
@@ -325,6 +336,28 @@ Return JSON only:
                 if rec == "SQUARE-OFF" and self.live and self.operator:
                     try:
                         exec_res = self.operator.square_off(symbol=symbol, live=True)
+
+                        # Record exit in trade tracker if successful
+                        if self.tracker and exec_res.get("status") == "ok":
+                            try:
+                                # Get current price for P&L calculation
+                                current_price = None
+                                if self.tech:
+                                    px, _ = self.tech.ltp(holding.get("instrument_key", ""))
+                                    current_price = float(px) if px else None
+
+                                if current_price:
+                                    pnl_record = self.tracker.record_exit(
+                                        symbol=symbol,
+                                        exit_price=current_price,
+                                        exit_reason="SWING_REVIEW_RECOMMENDATION",
+                                        order_id=exec_res.get("order_id"),
+                                    )
+                                    action["pnl_record"] = pnl_record
+                                    print(f"💰 P&L recorded: {symbol} → ₹{pnl_record.get('net_pnl', 0):.2f}")
+                            except Exception as e:
+                                print(f"⚠️ Error recording exit P&L: {e}")
+
                     except Exception as e:
                         exec_res = {"ok": False, "error": str(e)}
                     action["execution"] = exec_res
@@ -397,11 +430,34 @@ Return JSON only:
                         live=self.live,
                     )
 
-                    squared_positions.append({
+                    square_record = {
                         "symbol": symbol,
                         "result": result,
                         "time": now.isoformat(),
-                    })
+                    }
+
+                    # Record exit in trade tracker if successful
+                    if self.tracker and result.get("status") == "ok":
+                        try:
+                            # Get last traded price from position or fetch current
+                            exit_price = float(pos.get("last_price") or 0)
+                            if exit_price == 0 and self.tech:
+                                px, _ = self.tech.ltp(instrument_key)
+                                exit_price = float(px) if px else 0
+
+                            if exit_price > 0:
+                                pnl_record = self.tracker.record_exit(
+                                    symbol=symbol,
+                                    exit_price=exit_price,
+                                    exit_reason="INTRADAY_AUTO_SQUARE_OFF",
+                                    order_id=result.get("order_id"),
+                                )
+                                square_record["pnl_record"] = pnl_record
+                                print(f"💰 P&L: {symbol} → ₹{pnl_record.get('net_pnl', 0):.2f} ({pnl_record.get('pnl_percent', 0):+.2f}%)")
+                        except Exception as e:
+                            print(f"⚠️ Error recording exit P&L for {symbol}: {e}")
+
+                    squared_positions.append(square_record)
 
                     if result.get("status") == "ok":
                         print(f"✅ {symbol} squared off successfully")
@@ -933,12 +989,60 @@ Return only JSON like:
 
         exec_result = str(exec_crew.kickoff()).strip()
 
+        # Parse execution result to extract trade details
+        exec_data = None
+        try:
+            if "{" in exec_result:
+                json_start = exec_result.find("{")
+                json_end = exec_result.rfind("}") + 1
+                if json_end > json_start:
+                    exec_json_str = exec_result[json_start:json_end]
+                    exec_data = json.loads(exec_json_str)
+        except Exception as e:
+            print(f"⚠️ Could not parse execution result for trade tracking: {e}")
+
+        # Record trade entry in tracker if successful
+        trade_record = None
+        if self.tracker and exec_data and exec_data.get("status") in ("success", "ok"):
+            try:
+                # Extract order details
+                order_info = exec_data.get("order") or exec_data.get("entry") or {}
+                order_id = order_info.get("order_id")
+
+                # Get entry price from chosen plan
+                entry_price = float(chosen.get("entry", 0))
+                stop_loss = float(chosen.get("stop_loss") or 0) if chosen.get("stop_loss") else None
+                target = float(chosen.get("target") or 0) if chosen.get("target") else None
+
+                if entry_price > 0 and qty > 0:
+                    trade_record = self.tracker.record_entry(
+                        symbol=symbol,
+                        side=direction,
+                        quantity=qty,
+                        entry_price=entry_price,
+                        product=chosen.get("product", "I"),
+                        order_id=order_id,
+                        stop_loss=stop_loss,
+                        target=target,
+                        strategy=chosen.get("strategy", "ai_decision"),
+                        confidence=confidence,
+                        tags=[self.mode, chosen.get("style", "unknown")],
+                        metadata={
+                            "rationale": chosen.get("rationale"),
+                            "rr_ratio": chosen.get("rr_ratio"),
+                        }
+                    )
+                    print(f"📊 Trade recorded in tracker: {trade_record.get('trade_id')}")
+            except Exception as e:
+                print(f"⚠️ Error recording trade entry: {e}")
+
         result = {
             "symbol": symbol,
             "direction": direction,
             "plan": cleaned_plan_str,
             "execution": exec_result,
             "timestamp": datetime.now(IST).isoformat(),
+            "trade_record": trade_record,  # Add tracker record to result
         }
         self._emit_status("execution_complete", result)
         self._append_ledger(result)
@@ -1106,6 +1210,34 @@ Return only JSON like:
                 print(f"\n💰 Final capital: ₹{final_capital:,.2f} (used: ₹{initial_capital - final_capital:,.2f})")
             except Exception as e:
                 print(f"⚠️ Error fetching final capital: {e}")
+
+        # Get P&L summary for today
+        if self.tracker:
+            try:
+                daily_pnl = self.tracker.get_daily_pnl(self.today)
+                cycle_results["pnl_summary"] = daily_pnl
+
+                print(f"\n📊 Today's P&L Summary ({self.today}):")
+                print(f"   Total Trades: {daily_pnl.get('total_trades', 0)}")
+                print(f"   Gross P&L: ₹{daily_pnl.get('gross_pnl', 0):,.2f}")
+                print(f"   Charges: ₹{daily_pnl.get('charges', 0):,.2f}")
+                print(f"   Net P&L: ₹{daily_pnl.get('net_pnl', 0):,.2f}")
+                print(f"   Win Rate: {daily_pnl.get('win_rate', 0):.1f}%")
+                print(f"   Winners: {daily_pnl.get('winning_trades', 0)} | Losers: {daily_pnl.get('losing_trades', 0)}")
+
+                # Get overall trading statistics
+                stats = self.tracker.get_trade_statistics()
+                if not stats.get("error"):
+                    cycle_results["trading_statistics"] = stats
+                    print(f"\n📈 Overall Statistics:")
+                    print(f"   Total Trades: {stats.get('total_trades', 0)}")
+                    print(f"   Overall Win Rate: {stats.get('win_rate', 0):.1f}%")
+                    print(f"   Total P&L: ₹{stats.get('total_pnl', 0):,.2f}")
+                    print(f"   Avg P&L/Trade: ₹{stats.get('average_pnl_per_trade', 0):,.2f}")
+                    print(f"   Profit Factor: {stats.get('profit_factor', 0):.2f}")
+
+            except Exception as e:
+                print(f"⚠️ Error fetching P&L summary: {e}")
 
         cycle_results["end_time"] = datetime.now(IST).isoformat()
         self._save_decisions(cycle_results)
