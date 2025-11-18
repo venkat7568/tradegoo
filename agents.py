@@ -26,7 +26,7 @@ from langchain_openai import ChatOpenAI
 # LLM Factory (deterministic)
 # -----------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-5-mini"
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # Fixed: valid OpenAI model
 
 # Agent verbosity (set via env var, default True for visibility)
 AGENT_VERBOSE = os.environ.get("AGENT_VERBOSE", "true").lower() in ("true", "1", "yes")

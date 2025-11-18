@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -107,7 +108,8 @@ class TradeTracker:
 
         Returns market-ready JSON structure for the entry.
         """
-        trade_id = f"{symbol}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}"
+        # FIXED: Add UUID to prevent collisions if multiple trades in same second
+        trade_id = f"{symbol}_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
         entry_data = {
             # Trade identification
@@ -205,10 +207,15 @@ class TradeTracker:
         else:
             return {"error": "trade_id_or_symbol_required"}
 
-        # Get exit price (use provided or fetch current)
+        # FIXED: Require exit price - don't create fake 0 P&L records
         if exit_price is None:
-            logger.warning("Exit price not provided, P&L calculation will be incomplete")
-            exit_price = position["entry_price"]  # Fallback
+            logger.error("Exit price is required for P&L calculation!")
+            return {
+                "error": "exit_price_required",
+                "symbol": symbol,
+                "trade_id": trade_id,
+                "message": "Cannot calculate P&L without exit price"
+            }
 
         exit_price = float(exit_price)
 
