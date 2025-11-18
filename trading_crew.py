@@ -50,6 +50,9 @@ from news_client import NewsClient
 # Trade tracker for P&L calculation
 from trade_tracker import TradeTracker
 
+# Market context for sentiment and breadth analysis
+from market_context import MarketContext
+
 # Imperative operator for direct actions (optional)
 try:
     import upstox_operator as upop
@@ -145,6 +148,14 @@ class TradingCrew:
         except Exception as e:
             print(f"⚠️ Trade tracker init failed: {e}")
             self.tracker = None
+
+        # Initialize market context analyzer
+        try:
+            self.market_context = MarketContext(tech_client=self.tech)
+            print("✅ Market context analyzer initialized")
+        except Exception as e:
+            print(f"⚠️ Market context init failed: {e}")
+            self.market_context = None
 
         # Initialize agents with tools
         all_tools = [
@@ -484,9 +495,9 @@ Return JSON only:
         return squared_positions
 
     # -------------------------------
-    # Decision (news + tech)
+    # Decision (news + tech + market context)
     # -------------------------------
-    def decide_trade(self, symbol: str) -> Dict[str, Any]:
+    def decide_trade(self, symbol: str, market_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self._emit_status("decide_start", {"symbol": symbol})
 
         if symbol in self.memory.get("blacklist", []):
@@ -532,11 +543,39 @@ Return JSON only:
         mem_view = {
             k: self.memory[k] for k in ["w_news", "w_tech", "confidence_gate"]
         }
+
+        # Prepare market context summary for decision agent
+        market_summary = "Not available"
+        if market_ctx:
+            nifty = market_ctx.get("nifty", {})
+            breadth = market_ctx.get("breadth", {})
+            combined = market_ctx.get("combined_assessment", "UNKNOWN")
+
+            market_summary = f"""
+Nifty: {nifty.get('current_price', 0):.0f} ({nifty.get('change_percent', 0):+.2f}%)
+Trend: {nifty.get('trend', 'UNKNOWN')} | Sentiment: {nifty.get('sentiment', 'NEUTRAL')}
+Trading Bias: {nifty.get('trading_bias', 'SELECTIVE')}
+"""
+            if breadth and not breadth.get("error"):
+                market_summary += f"""Breadth: {breadth.get('advance_percent', 50):.0f}% advancing, {breadth.get('above_ema_percent', 50):.0f}% above EMA20
+Breadth Sentiment: {breadth.get('breadth_sentiment', 'NEUTRAL')}
+"""
+            market_summary += f"""Combined Assessment: {combined}
+Agent Guidance: {nifty.get('agent_guidance', 'No guidance available')}"""
+
         decision_desc = _tmpl(
-            """Make a trading decision for $symbol by synthesizing News + Technicals.
+            """Make a trading decision for $symbol by synthesizing News + Technicals + Market Context.
 
 Memory:
 $memory
+
+MARKET CONTEXT (Nifty & Breadth):
+$market_context
+
+IMPORTANT: Consider market context when making decisions:
+- In BEARISH markets (Nifty down, weak breadth): Be more conservative, require higher confidence, prefer defensive stocks
+- In BULLISH markets (Nifty up, strong breadth): Can be more aggressive with good setups
+- In MIXED/NEUTRAL markets: Stock-specific analysis more important, use normal thresholds
 
 CRITICAL: Determine STYLE (intraday vs swing) based on timeframe strengths.
 
@@ -548,11 +587,13 @@ STYLE SELECTION:
 CONFIDENCE CALCULATION (product-specific):
 
 FOR INTRADAY:
-- confidence = 0.70 × m30_strength + 0.30 × news_score
+- Base confidence = 0.70 × m30_strength + 0.30 × news_score
+- Adjust for market: +0.05 if market bullish, -0.05 if bearish
 - Gate: ≥0.60 (higher bar)
 
 FOR SWING:
-- confidence = 0.55 × d1_strength + 0.45 × news_score
+- Base confidence = 0.55 × d1_strength + 0.45 × news_score
+- Adjust for market: +0.05 if market bullish, -0.05 if bearish
 - Gate: ≥0.50
 
 ALIGNMENT:
@@ -562,12 +603,17 @@ ALIGNMENT:
    - tech_strength ≥ 0.75
 3) Otherwise → SKIP
 
+MARKET OVERRIDE:
+- If market is STRONG_BEARISH and stock signal is BUY: increase confidence requirement to 0.70
+- If market is STRONG_BULLISH and stock signal is BUY: can lower requirement to 0.55 (intraday) / 0.45 (swing)
+
 Return JSON only (include style!):
 {"direction":"BUY|SELL|SKIP","confidence":0..1,"style":"intraday|swing","rationale":"..."}
 """,
             symbol=symbol,
             memory=mem_view,
             gate=self.memory.get("confidence_gate", 0.50),
+            market_context=market_summary,
         )
 
         news_task = Task(
@@ -1090,6 +1136,39 @@ Return only JSON like:
             print(f"⚠️ Error fetching initial capital: {e}")
             initial_capital = 0.0
 
+        # Get market context (Nifty + breadth)
+        market_ctx = None
+        if self.market_context:
+            try:
+                print("\n📊 Fetching market context...")
+                # Get complete context with breadth analysis on provided symbols
+                market_ctx = self.market_context.get_complete_market_context(symbols=list(symbols))
+
+                nifty = market_ctx.get("nifty", {})
+                breadth = market_ctx.get("breadth", {})
+
+                print(f"\n🔍 Market Context:")
+                print(f"   Nifty: {nifty.get('current_price', 0):.2f} ({nifty.get('change_percent', 0):+.2f}%)")
+                print(f"   Trend: {nifty.get('trend', 'UNKNOWN')} | Sentiment: {nifty.get('sentiment', 'NEUTRAL')}")
+                print(f"   Trading Bias: {nifty.get('trading_bias', 'SELECTIVE')}")
+
+                if breadth and not breadth.get("error"):
+                    print(f"\n📈 Market Breadth ({breadth.get('stocks_analyzed', 0)} stocks):")
+                    print(f"   Advancing: {breadth.get('advance_percent', 0):.1f}% | Declining: {breadth.get('decline_percent', 0):.1f}%")
+                    print(f"   Above EMA20: {breadth.get('above_ema_percent', 0):.1f}%")
+                    print(f"   Breadth Sentiment: {breadth.get('breadth_sentiment', 'NEUTRAL')}")
+
+                if market_ctx.get("combined_assessment"):
+                    print(f"\n💡 Combined Assessment: {market_ctx.get('combined_assessment')}")
+                    print(f"   {market_ctx.get('recommendation', '')}")
+
+                cycle_results["market_context"] = market_ctx
+                self._emit_status("market_context_loaded", market_ctx)
+
+            except Exception as e:
+                print(f"⚠️ Error fetching market context: {e}")
+                market_ctx = None
+
         holdings_actions = self.review_holdings()
         cycle_results["holdings_review"] = holdings_actions
 
@@ -1151,7 +1230,7 @@ Return only JSON like:
                         print(f"⚠️ Error checking capital: {e}")
 
                 print(f"\n{'=' * 80}\n🎯 Processing {symbol} (Position {executed_positions + 1}/{max_positions})\n{'=' * 80}")
-                decision = self.decide_trade(symbol)
+                decision = self.decide_trade(symbol, market_ctx=market_ctx)
                 cycle_results["decisions"].append(decision)
 
                 if decision.get("direction") in ("BUY", "SELL"):
