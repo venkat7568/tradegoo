@@ -24,8 +24,52 @@ load_dotenv()
 # Local modules
 from trading_crew import TradingCrew
 import logging
+import logging.handlers
 
-# These imports may fail when tokens are missing; we’ll guard their usage
+# ============================================================================
+# LOGGING CONFIGURATION - Comprehensive logging to console + file
+# ============================================================================
+LOG_DIR = Path("./logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+# Create rotating file handler (max 10MB per file, keep 5 files)
+log_file = LOG_DIR / f"trading_{datetime.now().strftime('%Y%m%d')}.log"
+file_handler = logging.handlers.RotatingFileHandler(
+    log_file,
+    maxBytes=10 * 1024 * 1024,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+file_handler.setFormatter(file_formatter)
+
+# Console handler (less verbose)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Configure specific loggers
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# Create a dedicated logger for trading system
+trade_logger = logging.getLogger("trading_system")
+trade_logger.info("=" * 80)
+trade_logger.info(f"🚀 Trading system starting - Log file: {log_file}")
+trade_logger.info("=" * 80)
+
+# These imports may fail when tokens are missing; we'll guard their usage
 try:
     from upstox_operator import UpstoxOperator
 except Exception:

@@ -28,6 +28,9 @@ from langchain_openai import ChatOpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-5-mini"
 
+# Agent verbosity (set via env var, default True for visibility)
+AGENT_VERBOSE = os.environ.get("AGENT_VERBOSE", "true").lower() in ("true", "1", "yes")
+
 
 def get_llm() -> ChatOpenAI:
     """Return a configured, low-temperature OpenAI chat model."""
@@ -147,7 +150,7 @@ GUARDRAILS
         backstory=backstory,
         tools=_filter_tools(tools),  # lead doesn't need tools but pass harmlessly
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=True,
     )
 
@@ -203,7 +206,7 @@ OUTPUT
         backstory=backstory,
         tools=_pick_tools(tools, "Get Recent News and Broker Calls", "Search News by Query"),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -245,7 +248,7 @@ OUTPUT
         backstory=backstory,
         tools=_pick_tools(tools, "Get Technical Snapshot"),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -327,7 +330,7 @@ GUARDRAILS
             "Calculate ATR Stop Loss",
         ),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -389,7 +392,7 @@ IMPORTANT
             "Round to Tick Size",
         ),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -441,7 +444,7 @@ PROCESS
             "Round to Tick Size",
         ),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -493,7 +496,7 @@ DO NOT return arrays, nested objects, or anything complex. Just those 3 fields.
         backstory=backstory,
         tools=_pick_tools(tools, "Get Technical Snapshot", "Get Current Time"),
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 
@@ -535,7 +538,7 @@ PROCESS
         backstory=backstory,
         tools=_filter_tools(tools),  # not tool-driven by default; orchestrator supplies data
         llm=get_llm(),
-        verbose=False,
+        verbose=AGENT_VERBOSE,
         allow_delegation=False,
     )
 

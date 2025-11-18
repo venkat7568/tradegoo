@@ -12,6 +12,7 @@ pip-log.txt
 
 # Data and logs
 data/
+logs/
 *.log
 *.jsonl
 *.db

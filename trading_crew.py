@@ -86,12 +86,19 @@ class TradingCrew:
         live: bool = False,
         wait_for_open: bool = False,
         min_confidence_gate: Optional[float] = None,
+        crew_verbose: bool = None,
     ):
         self.mode = mode
         self.today = today or datetime.now(IST).strftime("%Y-%m-%d")
         self.live = bool(live)
         self.wait_for_open = bool(wait_for_open)
         self.min_confidence_gate = min_confidence_gate
+
+        # Crew verbosity (default from env, can be overridden)
+        if crew_verbose is None:
+            self.crew_verbose = os.environ.get("CREW_VERBOSE", "true").lower() in ("true", "1", "yes")
+        else:
+            self.crew_verbose = bool(crew_verbose)
 
         # File paths
         self.holdings_file = DATA_DIR / "holdings.json"
@@ -528,7 +535,7 @@ Return JSON only (include style!):
             agents=[self.agents["news"], self.agents["technical"], self.agents["lead"]],
             tasks=[news_task, tech_task, decision_task],
             process=Process.sequential,
-            verbose=False,
+            verbose=self.crew_verbose,
         )
 
         self._emit_status("decision_analyzing", {"symbol": symbol})
@@ -648,7 +655,7 @@ Return ONLY this JSON (NO arrays, NO nested objects):
             agents=[self.agents["entry_validator"]],
             tasks=[entry_task],
             process=Process.sequential,
-            verbose=False,
+            verbose=self.crew_verbose,
         )
 
         entry_result_str = str(entry_crew.kickoff()).strip()
@@ -803,7 +810,7 @@ IMPORTANT:
             agents=[self.agents["risk"]],
             tasks=[risk_task],
             process=Process.sequential,
-            verbose=False,
+            verbose=self.crew_verbose,
         )
 
         plan_str = str(risk_crew.kickoff()).strip()
@@ -921,7 +928,7 @@ Return only JSON like:
             agents=[self.agents["executor"]],
             tasks=[exec_task],
             process=Process.sequential,
-            verbose=False,
+            verbose=self.crew_verbose,
         )
 
         exec_result = str(exec_crew.kickoff()).strip()
@@ -1133,7 +1140,7 @@ Return JSON with:
             agents=[self.agents["learner"]],
             tasks=[task],
             process=Process.sequential,
-            verbose=False,
+            verbose=self.crew_verbose,
         )
 
         result = str(crew.kickoff()).strip()
