@@ -201,12 +201,28 @@ HTML = r"""{% raw %}
                         <option value="true">Live Orders ⚠️</option>
                     </select>
                 </div>
+
+                <div class="form-group">
+                    <label>Max Companies to Analyze</label>
+                    <input type="number" id="max-symbols" min="5" max="50" value="20" placeholder="20">
+                    <div style="font-size: 11px; color: #666; margin-top: 5px;">Default: 20 symbols per cycle</div>
+                </div>
+
+                <div class="form-group">
+                    <label>Learning Mode 🧠</label>
+                    <select id="learning-mode">
+                        <option value="true">Enabled (Learns from trades)</option>
+                        <option value="false">Disabled</option>
+                    </select>
+                    <div style="font-size: 11px; color: #666; margin-top: 5px;">System improves from past trades</div>
+                </div>
             </div>
 
             <div style="margin-top: 20px; display: flex; gap: 15px;">
                 <button id="btn-start" class="btn-success" onclick="startTrading()">▶️ Start Auto Trading</button>
                 <button id="btn-stop" class="btn-danger" onclick="stopTrading()" disabled>⏹️ Stop</button>
                 <button class="btn-primary" onclick="refreshData()">🔄 Refresh</button>
+                <button class="btn-primary" onclick="runLearning()">🎓 Run Learning Analysis</button>
             </div>
 
             <div style="margin-top: 20px; padding: 15px; background: #fffbeb; border-radius: 8px; border-left: 4px solid #f59e0b;">
@@ -286,6 +302,8 @@ HTML = r"""{% raw %}
             const mode = document.getElementById('mode').value;
             const date = document.getElementById('backtest-date').value;
             const live = document.getElementById('live-mode').value === 'true';
+            const maxSymbols = parseInt(document.getElementById('max-symbols').value) || 20;
+            const learningMode = document.getElementById('learning-mode').value === 'true';
 
             if (live && !confirm('⚠️ WARNING: Live trading will use REAL MONEY! Continue?')) return;
 
@@ -293,12 +311,13 @@ HTML = r"""{% raw %}
             document.getElementById('btn-stop').disabled = false;
 
             addActivity('🚀 Starting... Mode: ' + mode + ', Live: ' + (live ? 'YES ⚠️' : 'Paper'));
+            addActivity('📊 Max symbols: ' + maxSymbols + ', Learning: ' + (learningMode ? 'ON 🧠' : 'OFF'));
 
             try {
                 const resp = await fetch('/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mode, date, live })
+                    body: JSON.stringify({ mode, date, live, max_symbols: maxSymbols, learning_mode: learningMode })
                 });
                 const result = await resp.json();
                 if (result.status === 'ok') {
@@ -323,6 +342,24 @@ HTML = r"""{% raw %}
                 document.getElementById('btn-stop').disabled = true;
             } catch (error) {
                 addActivity('❌ Failed to stop: ' + error);
+            }
+        }
+
+        async function runLearning() {
+            addActivity('🎓 Running learning analysis...');
+            try {
+                const resp = await fetch('/learning', { method: 'POST' });
+                const result = await resp.json();
+                if (result.status === 'ok') {
+                    addActivity('✅ Learning analysis complete!');
+                    if (result.insights) {
+                        addActivity('📊 Insights: ' + result.insights);
+                    }
+                } else {
+                    addActivity('❌ Learning error: ' + (result.message || 'Unknown'));
+                }
+            } catch (error) {
+                addActivity('❌ Failed to run learning: ' + error);
             }
         }
 
@@ -380,7 +417,7 @@ def _crew_status_to_text(payload: dict) -> str:
     return f"ℹ️ {event}"
 
 # ---------- NEW: pure news-based discovery using UpstoxTechnicalClient.resolve ----------
-def discover_and_validate_symbols(mode, date):
+def discover_and_validate_symbols(mode, date, max_symbols=20):
     """
     Discover tradable NSE/BSE symbols purely from latest news.
     No static TRADING_SYMBOLS. We:
@@ -519,9 +556,9 @@ def discover_and_validate_symbols(mode, date):
             })
             emit_status(f"✅ From news: {hint} → {sym} ({name})")
 
-            if len(validated) >= MAX_DISCOVERED_SYMBOLS:
+            if len(validated) >= max_symbols:
                 break
-        if len(validated) >= MAX_DISCOVERED_SYMBOLS:
+        if len(validated) >= max_symbols:
             break
 
     if not validated:
@@ -555,7 +592,7 @@ def discover_and_validate_symbols(mode, date):
                     "source": "fallback"
                 })
 
-                if len(validated) >= MAX_DISCOVERED_SYMBOLS:
+                if len(validated) >= max_symbols:
                     break
             except Exception:
                 continue
@@ -569,11 +606,12 @@ def discover_and_validate_symbols(mode, date):
 
     return validated
 
-def trading_loop(mode, date, live):
+def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
     global trading_active
     try:
         trading_active = True
         emit_status(f"🚀 Trading system started (mode={mode}, date={date}, live={'ON' if live else 'OFF'})")
+        emit_status(f"⚙️ Settings: max_symbols={max_symbols}, learning={'ON' if learning_mode else 'OFF'}")
 
         operator = UpstoxOperator() if UpstoxOperator else None
         if mode == "live" and operator:
@@ -588,7 +626,7 @@ def trading_loop(mode, date, live):
             except Exception as e:
                 emit_status(f"⚠️ Market status error: {e}")
 
-        validated_symbols = discover_and_validate_symbols(mode, date)
+        validated_symbols = discover_and_validate_symbols(mode, date, max_symbols)
         if not validated_symbols:
             emit_status("❌ No valid symbols to trade")
             return
@@ -617,6 +655,18 @@ def trading_loop(mode, date, live):
             sell_count = sum(1 for d in decisions if d.get("direction") == "SELL")
             skip_count = sum(1 for d in decisions if d.get("direction") == "SKIP")
             emit_status(f"📈 Summary: {buy_count} BUY, {sell_count} SELL, {skip_count} SKIP")
+
+            # Run learning analysis if enabled
+            if learning_mode and executions:
+                try:
+                    emit_status("🎓 Running learning analysis...")
+                    learning_result = crew.run_learning_mode(days=7)
+                    if learning_result:
+                        summary = learning_result.get("summary", "Learning complete")
+                        emit_status(f"🧠 {summary}")
+                except Exception as learning_error:
+                    emit_status(f"⚠️ Learning analysis error: {str(learning_error)}")
+
         except Exception as e:
             emit_status(f"❌ Trading cycle error: {str(e)}")
 
@@ -678,7 +728,9 @@ def start_trading():
     mode = data.get("mode", "live")
     date = data.get("date")
     live = bool(data.get("live", False))
-    threading.Thread(target=trading_loop, args=(mode, date, live), daemon=True).start()
+    max_symbols = int(data.get("max_symbols", 20))
+    learning_mode = bool(data.get("learning_mode", True))
+    threading.Thread(target=trading_loop, args=(mode, date, live, max_symbols, learning_mode), daemon=True).start()
     return jsonify({"status": "ok"})
 
 @app.route("/stop", methods=["POST"])
@@ -686,6 +738,30 @@ def stop_trading():
     global trading_active
     trading_active = False
     return jsonify({"status": "ok"})
+
+@app.route("/learning", methods=["POST"])
+def run_learning():
+    """Run learning analysis on recent trades."""
+    try:
+        emit_status("🎓 Starting learning analysis...")
+        crew = TradingCrew(mode="backtest", live=False)
+        learning_result = crew.run_learning_mode(days=30)
+
+        insights = learning_result.get("summary", "Analysis complete")
+        emit_status(f"✅ Learning complete: {insights}")
+
+        return jsonify({
+            "status": "ok",
+            "insights": insights,
+            "result": learning_result
+        })
+    except Exception as e:
+        app.logger.error(f"Learning error: {e}")
+        emit_status(f"❌ Learning failed: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        })
 
 @app.route("/stream")
 def stream():
