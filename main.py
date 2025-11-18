@@ -97,6 +97,7 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'trading-secret-20
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 trading_active = False
 status_queue = queue.Queue()
+current_companies_data = []  # Track companies being analyzed
 
 HTML = r"""{% raw %}
 <!DOCTYPE html>
@@ -646,10 +647,23 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
         emit_status(f"📊 Running decision cycle for {len(validated_symbols)} symbols...")
         symbols_to_trade = [s["symbol"] for s in validated_symbols]
 
+        # Update companies being analyzed for UI
+        global current_companies_data
+        current_companies_data = [{"symbol": s["symbol"], "name": s.get("name", s["symbol"]), "decision": None} for s in validated_symbols]
+
         try:
             results = crew.run_decision_cycle(symbols_to_trade)
             decisions = results.get("decisions", [])
             executions = results.get("executions", [])
+
+            # Update company decisions for UI
+            for decision in decisions:
+                symbol = decision.get("symbol")
+                direction = decision.get("direction")
+                for comp in current_companies_data:
+                    if comp["symbol"] == symbol:
+                        comp["decision"] = direction
+                        break
             emit_status(f"✅ Cycle complete: {len(decisions)} decisions, {len(executions)} executions")
             buy_count  = sum(1 for d in decisions if d.get("direction") == "BUY")
             sell_count = sum(1 for d in decisions if d.get("direction") == "SELL")
@@ -676,6 +690,8 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
         emit_status(f"❌ System error: {str(e)}")
     finally:
         trading_active = False
+        global current_companies_data
+        current_companies_data = []  # Clear on stop
         emit_status("⏹️ System stopped")
 
 def status_stream():
@@ -693,6 +709,16 @@ def status_stream():
 
 @app.route("/")
 def index():
+    """Serve the enhanced dashboard."""
+    try:
+        dashboard_path = Path(__file__).parent / "dashboard_ui.html"
+        if dashboard_path.exists():
+            with open(dashboard_path, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception as e:
+        app.logger.error(f"Dashboard error: {e}")
+
+    # Fallback to old UI if dashboard not found
     return render_template_string(HTML)
 
 @app.route("/health")
@@ -763,9 +789,134 @@ def run_learning():
             "message": str(e)
         })
 
+@app.route("/wallet")
+def get_wallet():
+    """Get wallet/money management data for both live and paper trading."""
+    try:
+        from money_manager import get_money_manager
+        from trade_tracker import get_trade_tracker
+
+        mm = get_money_manager()
+        tracker = get_trade_tracker()
+
+        wallet_status = mm.get_wallet_status()
+        daily_pnl = tracker.get_daily_pnl()
+
+        return jsonify({
+            "status": "ok",
+            "total_capital": wallet_status.get("total_capital", 0),
+            "available_capital": wallet_status.get("available_capital", 0),
+            "used_capital": wallet_status.get("used_capital", 0),
+            "daily_pnl": daily_pnl.get("net_pnl", 0),
+            "can_trade": wallet_status.get("can_trade", False),
+            "max_positions": wallet_status.get("max_positions", 0),
+        })
+    except Exception as e:
+        app.logger.error(f"Wallet error: {e}")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/positions")
+def get_positions():
+    """Get all open positions."""
+    try:
+        from trade_tracker import get_trade_tracker
+        from upstox_technical import UpstoxTechnicalClient
+
+        tracker = get_trade_tracker()
+        tech_client = UpstoxTechnicalClient() if UpstoxTechnicalClient else None
+
+        open_positions = tracker.get_open_positions()
+
+        # Enrich with current price if available
+        if tech_client:
+            for pos in open_positions:
+                try:
+                    ltp, _ = tech_client.ltp(pos.get("instrument_key", pos["symbol"]))
+                    if ltp:
+                        pos["ltp"] = float(ltp)
+                        entry = pos.get("entry_price", 0)
+                        qty = pos.get("quantity", 0)
+                        side = pos.get("side", "BUY")
+
+                        if side == "BUY":
+                            pos["unrealized_pnl"] = (ltp - entry) * qty
+                        else:
+                            pos["unrealized_pnl"] = (entry - ltp) * qty
+                except Exception:
+                    pass
+
+        return jsonify({
+            "status": "ok",
+            "positions": open_positions
+        })
+    except Exception as e:
+        app.logger.error(f"Positions error: {e}")
+        return jsonify({"status": "error", "message": str(e), "positions": []})
+
+@app.route("/holdings")
+def get_holdings():
+    """Get current holdings."""
+    try:
+        if not UpstoxOperator:
+            return jsonify({"status": "ok", "holdings": []})
+
+        operator = UpstoxOperator()
+        holdings_data = operator.get_holdings()
+
+        if holdings_data.get("status") == "ok":
+            return jsonify({
+                "status": "ok",
+                "holdings": holdings_data.get("holdings", [])
+            })
+        else:
+            return jsonify({"status": "ok", "holdings": []})
+    except Exception as e:
+        app.logger.error(f"Holdings error: {e}")
+        return jsonify({"status": "ok", "holdings": []})
+
+@app.route("/trades")
+def get_trades():
+    """Get today's trade history."""
+    try:
+        from trade_tracker import get_trade_tracker
+
+        tracker = get_trade_tracker()
+        daily_pnl = tracker.get_daily_pnl()
+
+        return jsonify({
+            "status": "ok",
+            "trades": daily_pnl.get("trades", [])
+        })
+    except Exception as e:
+        app.logger.error(f"Trades error: {e}")
+        return jsonify({"status": "ok", "trades": []})
+
+@app.route("/companies")
+def get_companies():
+    """Get companies currently being analyzed."""
+    global current_companies_data
+
+    try:
+        return jsonify({
+            "status": "ok",
+            "companies": current_companies_data
+        })
+    except Exception as e:
+        return jsonify({"status": "ok", "companies": []})
+
 @app.route("/stream")
 def stream():
     return status_stream()
+
+@app.route("/dashboard")
+def dashboard():
+    """Serve the enhanced dashboard."""
+    try:
+        dashboard_path = Path(__file__).parent / "dashboard_ui.html"
+        with open(dashboard_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return "Dashboard not found", 404
 
 if __name__ == "__main__":
     print("\n" + "="*70)
