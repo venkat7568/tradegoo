@@ -47,6 +47,21 @@ from crew_tools import (
 from upstox_technical import UpstoxTechnicalClient
 from news_client import NewsClient
 
+# Trade tracker for P&L calculation
+from trade_tracker import TradeTracker
+
+# Market context for sentiment and breadth analysis
+from market_context import MarketContext
+
+# Position monitor for tracking SL/target hits
+from position_monitor import PositionMonitor
+
+# Money manager for capital allocation
+from money_manager import MoneyManager
+
+# Learning engine for continuous improvement
+from learning_engine import LearningEngine
+
 # Imperative operator for direct actions (optional)
 try:
     import upstox_operator as upop
@@ -134,6 +149,50 @@ class TradingCrew:
         except Exception as e:
             print(f"⚠️ Operator init failed: {e}")
             self.operator = None
+
+        # Initialize trade tracker for P&L tracking
+        try:
+            self.tracker = TradeTracker()
+            print("✅ Trade tracker initialized")
+        except Exception as e:
+            print(f"⚠️ Trade tracker init failed: {e}")
+            self.tracker = None
+
+        # Initialize market context analyzer
+        try:
+            self.market_context = MarketContext(tech_client=self.tech)
+            print("✅ Market context analyzer initialized")
+        except Exception as e:
+            print(f"⚠️ Market context init failed: {e}")
+            self.market_context = None
+
+        # Initialize position monitor
+        try:
+            self.position_monitor = PositionMonitor(
+                operator=self.operator,
+                tech_client=self.tech,
+                trade_tracker=self.tracker
+            )
+            print("✅ Position monitor initialized")
+        except Exception as e:
+            print(f"⚠️ Position monitor init failed: {e}")
+            self.position_monitor = None
+
+        # Initialize money manager
+        try:
+            self.money_manager = MoneyManager(operator=self.operator)
+            print("✅ Money manager initialized")
+        except Exception as e:
+            print(f"⚠️ Money manager init failed: {e}")
+            self.money_manager = None
+
+        # Initialize learning engine
+        try:
+            self.learning_engine = LearningEngine(trade_tracker=self.tracker)
+            print("✅ Learning engine initialized")
+        except Exception as e:
+            print(f"⚠️ Learning engine init failed: {e}")
+            self.learning_engine = None
 
         # Initialize agents with tools
         all_tools = [
@@ -325,6 +384,28 @@ Return JSON only:
                 if rec == "SQUARE-OFF" and self.live and self.operator:
                     try:
                         exec_res = self.operator.square_off(symbol=symbol, live=True)
+
+                        # Record exit in trade tracker if successful
+                        if self.tracker and exec_res.get("status") == "ok":
+                            try:
+                                # Get current price for P&L calculation
+                                current_price = None
+                                if self.tech:
+                                    px, _ = self.tech.ltp(holding.get("instrument_key", ""))
+                                    current_price = float(px) if px else None
+
+                                if current_price:
+                                    pnl_record = self.tracker.record_exit(
+                                        symbol=symbol,
+                                        exit_price=current_price,
+                                        exit_reason="SWING_REVIEW_RECOMMENDATION",
+                                        order_id=exec_res.get("order_id"),
+                                    )
+                                    action["pnl_record"] = pnl_record
+                                    print(f"💰 P&L recorded: {symbol} → ₹{pnl_record.get('net_pnl', 0):.2f}")
+                            except Exception as e:
+                                print(f"⚠️ Error recording exit P&L: {e}")
+
                     except Exception as e:
                         exec_res = {"ok": False, "error": str(e)}
                     action["execution"] = exec_res
@@ -397,11 +478,34 @@ Return JSON only:
                         live=self.live,
                     )
 
-                    squared_positions.append({
+                    square_record = {
                         "symbol": symbol,
                         "result": result,
                         "time": now.isoformat(),
-                    })
+                    }
+
+                    # Record exit in trade tracker if successful
+                    if self.tracker and result.get("status") == "ok":
+                        try:
+                            # Get last traded price from position or fetch current
+                            exit_price = float(pos.get("last_price") or 0)
+                            if exit_price == 0 and self.tech:
+                                px, _ = self.tech.ltp(instrument_key)
+                                exit_price = float(px) if px else 0
+
+                            if exit_price > 0:
+                                pnl_record = self.tracker.record_exit(
+                                    symbol=symbol,
+                                    exit_price=exit_price,
+                                    exit_reason="INTRADAY_AUTO_SQUARE_OFF",
+                                    order_id=result.get("order_id"),
+                                )
+                                square_record["pnl_record"] = pnl_record
+                                print(f"💰 P&L: {symbol} → ₹{pnl_record.get('net_pnl', 0):.2f} ({pnl_record.get('pnl_percent', 0):+.2f}%)")
+                        except Exception as e:
+                            print(f"⚠️ Error recording exit P&L for {symbol}: {e}")
+
+                    squared_positions.append(square_record)
 
                     if result.get("status") == "ok":
                         print(f"✅ {symbol} squared off successfully")
@@ -428,9 +532,9 @@ Return JSON only:
         return squared_positions
 
     # -------------------------------
-    # Decision (news + tech)
+    # Decision (news + tech + market context)
     # -------------------------------
-    def decide_trade(self, symbol: str) -> Dict[str, Any]:
+    def decide_trade(self, symbol: str, market_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self._emit_status("decide_start", {"symbol": symbol})
 
         if symbol in self.memory.get("blacklist", []):
@@ -476,11 +580,39 @@ Return JSON only:
         mem_view = {
             k: self.memory[k] for k in ["w_news", "w_tech", "confidence_gate"]
         }
+
+        # Prepare market context summary for decision agent
+        market_summary = "Not available"
+        if market_ctx:
+            nifty = market_ctx.get("nifty", {})
+            breadth = market_ctx.get("breadth", {})
+            combined = market_ctx.get("combined_assessment", "UNKNOWN")
+
+            market_summary = f"""
+Nifty: {nifty.get('current_price', 0):.0f} ({nifty.get('change_percent', 0):+.2f}%)
+Trend: {nifty.get('trend', 'UNKNOWN')} | Sentiment: {nifty.get('sentiment', 'NEUTRAL')}
+Trading Bias: {nifty.get('trading_bias', 'SELECTIVE')}
+"""
+            if breadth and not breadth.get("error"):
+                market_summary += f"""Breadth: {breadth.get('advance_percent', 50):.0f}% advancing, {breadth.get('above_ema_percent', 50):.0f}% above EMA20
+Breadth Sentiment: {breadth.get('breadth_sentiment', 'NEUTRAL')}
+"""
+            market_summary += f"""Combined Assessment: {combined}
+Agent Guidance: {nifty.get('agent_guidance', 'No guidance available')}"""
+
         decision_desc = _tmpl(
-            """Make a trading decision for $symbol by synthesizing News + Technicals.
+            """Make a trading decision for $symbol by synthesizing News + Technicals + Market Context.
 
 Memory:
 $memory
+
+MARKET CONTEXT (Nifty & Breadth):
+$market_context
+
+IMPORTANT: Consider market context when making decisions:
+- In BEARISH markets (Nifty down, weak breadth): Be more conservative, require higher confidence, prefer defensive stocks
+- In BULLISH markets (Nifty up, strong breadth): Can be more aggressive with good setups
+- In MIXED/NEUTRAL markets: Stock-specific analysis more important, use normal thresholds
 
 CRITICAL: Determine STYLE (intraday vs swing) based on timeframe strengths.
 
@@ -492,11 +624,13 @@ STYLE SELECTION:
 CONFIDENCE CALCULATION (product-specific):
 
 FOR INTRADAY:
-- confidence = 0.70 × m30_strength + 0.30 × news_score
+- Base confidence = 0.70 × m30_strength + 0.30 × news_score
+- Adjust for market: +0.05 if market bullish, -0.05 if bearish
 - Gate: ≥0.60 (higher bar)
 
 FOR SWING:
-- confidence = 0.55 × d1_strength + 0.45 × news_score
+- Base confidence = 0.55 × d1_strength + 0.45 × news_score
+- Adjust for market: +0.05 if market bullish, -0.05 if bearish
 - Gate: ≥0.50
 
 ALIGNMENT:
@@ -506,12 +640,17 @@ ALIGNMENT:
    - tech_strength ≥ 0.75
 3) Otherwise → SKIP
 
+MARKET OVERRIDE:
+- If market is STRONG_BEARISH and stock signal is BUY: increase confidence requirement to 0.70
+- If market is STRONG_BULLISH and stock signal is BUY: can lower requirement to 0.55 (intraday) / 0.45 (swing)
+
 Return JSON only (include style!):
 {"direction":"BUY|SELL|SKIP","confidence":0..1,"style":"intraday|swing","rationale":"..."}
 """,
             symbol=symbol,
             memory=mem_view,
             gate=self.memory.get("confidence_gate", 0.50),
+            market_context=market_summary,
         )
 
         news_task = Task(
@@ -933,12 +1072,60 @@ Return only JSON like:
 
         exec_result = str(exec_crew.kickoff()).strip()
 
+        # Parse execution result to extract trade details
+        exec_data = None
+        try:
+            if "{" in exec_result:
+                json_start = exec_result.find("{")
+                json_end = exec_result.rfind("}") + 1
+                if json_end > json_start:
+                    exec_json_str = exec_result[json_start:json_end]
+                    exec_data = json.loads(exec_json_str)
+        except Exception as e:
+            print(f"⚠️ Could not parse execution result for trade tracking: {e}")
+
+        # Record trade entry in tracker if successful
+        trade_record = None
+        if self.tracker and exec_data and exec_data.get("status") in ("success", "ok"):
+            try:
+                # Extract order details
+                order_info = exec_data.get("order") or exec_data.get("entry") or {}
+                order_id = order_info.get("order_id")
+
+                # Get entry price from chosen plan
+                entry_price = float(chosen.get("entry", 0))
+                stop_loss = float(chosen.get("stop_loss") or 0) if chosen.get("stop_loss") else None
+                target = float(chosen.get("target") or 0) if chosen.get("target") else None
+
+                if entry_price > 0 and qty > 0:
+                    trade_record = self.tracker.record_entry(
+                        symbol=symbol,
+                        side=direction,
+                        quantity=qty,
+                        entry_price=entry_price,
+                        product=chosen.get("product", "I"),
+                        order_id=order_id,
+                        stop_loss=stop_loss,
+                        target=target,
+                        strategy=chosen.get("strategy", "ai_decision"),
+                        confidence=confidence,
+                        tags=[self.mode, chosen.get("style", "unknown")],
+                        metadata={
+                            "rationale": chosen.get("rationale"),
+                            "rr_ratio": chosen.get("rr_ratio"),
+                        }
+                    )
+                    print(f"📊 Trade recorded in tracker: {trade_record.get('trade_id')}")
+            except Exception as e:
+                print(f"⚠️ Error recording trade entry: {e}")
+
         result = {
             "symbol": symbol,
             "direction": direction,
             "plan": cleaned_plan_str,
             "execution": exec_result,
             "timestamp": datetime.now(IST).isoformat(),
+            "trade_record": trade_record,  # Add tracker record to result
         }
         self._emit_status("execution_complete", result)
         self._append_ledger(result)
@@ -970,9 +1157,33 @@ Return only JSON like:
             },
         }
 
-        # Get initial capital
+        # Get initial capital and wallet status
         try:
-            if self.operator:
+            if self.money_manager:
+                # Get comprehensive wallet status
+                wallet_status = self.money_manager.get_wallet_status()
+                cycle_results["wallet_status"] = wallet_status
+
+                initial_capital = wallet_status.get("available_capital", 0)
+                cycle_results["capital_tracking"]["initial_capital"] = initial_capital
+
+                print(f"\n💰 Wallet Status:")
+                print(f"   Total Capital: ₹{wallet_status.get('total_capital', 0):,.2f}")
+                print(f"   Available: ₹{wallet_status.get('available_capital', 0):,.2f}")
+                print(f"   Used: ₹{wallet_status.get('used_capital', 0):,.2f} ({wallet_status.get('capital_usage_pct', 0):.1f}%)")
+                print(f"   Intraday Allocation: ₹{wallet_status.get('intraday_allocation', 0):,.2f}")
+                print(f"   Swing Allocation: ₹{wallet_status.get('swing_allocation', 0):,.2f}")
+                print(f"   Daily P&L: ₹{wallet_status.get('daily_pnl', 0):,.2f}")
+                print(f"   Daily Trades: {wallet_status.get('daily_trades', 0)}/{wallet_status.get('max_daily_trades', 0)}")
+
+                if not wallet_status.get("can_trade"):
+                    print(f"\n⚠️ TRADING BLOCKED: {', '.join(wallet_status.get('blocking_reasons', []))}")
+                    cycle_results["trading_blocked"] = True
+                    cycle_results["blocking_reasons"] = wallet_status.get("blocking_reasons", [])
+                else:
+                    print(f"\n✅ Trading allowed - All limits OK")
+
+            elif self.operator:
                 funds = self.operator.get_funds()
                 initial_capital = float(
                     (funds.get("equity") or {}).get("available_margin", 0) or 0
@@ -983,8 +1194,41 @@ Return only JSON like:
                 initial_capital = 0.0
                 print("⚠️ Operator not available, capital tracking disabled")
         except Exception as e:
-            print(f"⚠️ Error fetching initial capital: {e}")
+            print(f"⚠️ Error fetching wallet status: {e}")
             initial_capital = 0.0
+
+        # Get market context (Nifty + breadth)
+        market_ctx = None
+        if self.market_context:
+            try:
+                print("\n📊 Fetching market context...")
+                # Get complete context with breadth analysis on provided symbols
+                market_ctx = self.market_context.get_complete_market_context(symbols=list(symbols))
+
+                nifty = market_ctx.get("nifty", {})
+                breadth = market_ctx.get("breadth", {})
+
+                print(f"\n🔍 Market Context:")
+                print(f"   Nifty: {nifty.get('current_price', 0):.2f} ({nifty.get('change_percent', 0):+.2f}%)")
+                print(f"   Trend: {nifty.get('trend', 'UNKNOWN')} | Sentiment: {nifty.get('sentiment', 'NEUTRAL')}")
+                print(f"   Trading Bias: {nifty.get('trading_bias', 'SELECTIVE')}")
+
+                if breadth and not breadth.get("error"):
+                    print(f"\n📈 Market Breadth ({breadth.get('stocks_analyzed', 0)} stocks):")
+                    print(f"   Advancing: {breadth.get('advance_percent', 0):.1f}% | Declining: {breadth.get('decline_percent', 0):.1f}%")
+                    print(f"   Above EMA20: {breadth.get('above_ema_percent', 0):.1f}%")
+                    print(f"   Breadth Sentiment: {breadth.get('breadth_sentiment', 'NEUTRAL')}")
+
+                if market_ctx.get("combined_assessment"):
+                    print(f"\n💡 Combined Assessment: {market_ctx.get('combined_assessment')}")
+                    print(f"   {market_ctx.get('recommendation', '')}")
+
+                cycle_results["market_context"] = market_ctx
+                self._emit_status("market_context_loaded", market_ctx)
+
+            except Exception as e:
+                print(f"⚠️ Error fetching market context: {e}")
+                market_ctx = None
 
         holdings_actions = self.review_holdings()
         cycle_results["holdings_review"] = holdings_actions
@@ -1047,7 +1291,7 @@ Return only JSON like:
                         print(f"⚠️ Error checking capital: {e}")
 
                 print(f"\n{'=' * 80}\n🎯 Processing {symbol} (Position {executed_positions + 1}/{max_positions})\n{'=' * 80}")
-                decision = self.decide_trade(symbol)
+                decision = self.decide_trade(symbol, market_ctx=market_ctx)
                 cycle_results["decisions"].append(decision)
 
                 if decision.get("direction") in ("BUY", "SELL"):
@@ -1107,62 +1351,234 @@ Return only JSON like:
             except Exception as e:
                 print(f"⚠️ Error fetching final capital: {e}")
 
+        # Get P&L summary for today
+        if self.tracker:
+            try:
+                daily_pnl = self.tracker.get_daily_pnl(self.today)
+                cycle_results["pnl_summary"] = daily_pnl
+
+                print(f"\n📊 Today's P&L Summary ({self.today}):")
+                print(f"   Total Trades: {daily_pnl.get('total_trades', 0)}")
+                print(f"   Gross P&L: ₹{daily_pnl.get('gross_pnl', 0):,.2f}")
+                print(f"   Charges: ₹{daily_pnl.get('charges', 0):,.2f}")
+                print(f"   Net P&L: ₹{daily_pnl.get('net_pnl', 0):,.2f}")
+                print(f"   Win Rate: {daily_pnl.get('win_rate', 0):.1f}%")
+                print(f"   Winners: {daily_pnl.get('winning_trades', 0)} | Losers: {daily_pnl.get('losing_trades', 0)}")
+
+                # Get overall trading statistics
+                stats = self.tracker.get_trade_statistics()
+                if not stats.get("error"):
+                    cycle_results["trading_statistics"] = stats
+                    print(f"\n📈 Overall Statistics:")
+                    print(f"   Total Trades: {stats.get('total_trades', 0)}")
+                    print(f"   Overall Win Rate: {stats.get('win_rate', 0):.1f}%")
+                    print(f"   Total P&L: ₹{stats.get('total_pnl', 0):,.2f}")
+                    print(f"   Avg P&L/Trade: ₹{stats.get('average_pnl_per_trade', 0):,.2f}")
+                    print(f"   Profit Factor: {stats.get('profit_factor', 0):.2f}")
+
+            except Exception as e:
+                print(f"⚠️ Error fetching P&L summary: {e}")
+
+        # Check open positions for SL/target hits
+        if self.position_monitor:
+            try:
+                print(f"\n🔍 Checking open positions for SL/target hits...")
+                position_check = self.position_monitor.check_positions(live=self.live)
+
+                cycle_results["position_check"] = position_check
+
+                if position_check.get("actions_taken"):
+                    print(f"\n⚡ Position Actions:")
+                    for action in position_check["actions_taken"]:
+                        symbol = action.get("symbol")
+                        reason = action.get("exit_reason")
+                        pnl_record = action.get("pnl_record", {})
+                        net_pnl = pnl_record.get("net_pnl", 0)
+
+                        print(f"   {symbol}: {reason} → P&L: ₹{net_pnl:,.2f}")
+
+                        # Update money manager with this trade result
+                        if self.money_manager and pnl_record:
+                            self.money_manager.record_trade_result(
+                                net_pnl=net_pnl,
+                                product=pnl_record.get("product", "I")
+                            )
+                else:
+                    print(f"   No position exits triggered")
+
+                # Show position summary
+                pos_summary = self.position_monitor.get_position_summary()
+                if pos_summary.get("total_positions", 0) > 0:
+                    print(f"\n📊 Open Positions: {pos_summary.get('total_positions', 0)}")
+                    print(f"   Intraday: {pos_summary.get('intraday_count', 0)} | Swing: {pos_summary.get('swing_count', 0)}")
+                    print(f"   Unrealized P&L: ₹{pos_summary.get('total_unrealized_pnl', 0):,.2f}")
+
+            except Exception as e:
+                print(f"⚠️ Error checking positions: {e}")
+
         cycle_results["end_time"] = datetime.now(IST).isoformat()
         self._save_decisions(cycle_results)
         self._emit_status("cycle_complete", cycle_results)
         return cycle_results
 
     # -------------------------------
-    # Learning mode
+    # Learning mode - Enhanced with Learning Engine
     # -------------------------------
-    def run_learning_mode(self) -> Dict[str, Any]:
-        self._emit_status("learning_start", {})
+    def run_learning_mode(self, days: int = 30) -> Dict[str, Any]:
+        """
+        Run comprehensive learning analysis on recent trades.
 
-        desc = _tmpl(
-            """Analyze ledger and output small parameter tweaks.
+        Analyzes what worked, what didn't, and adjusts parameters.
+        This makes the system better every day!
 
-Current Memory:
-$memory
+        Args:
+            days: Number of days of history to analyze
 
-Return JSON with:
-- w_news (0..1), w_tech (0..1), confidence_gate (0..1), risk_base_pct (0..2),
-- blacklist_delta: {"add":[...],"remove":[...]}""",
-            memory=self.memory,
-        )
+        Returns:
+            Learning analysis with recommendations and adjustments
+        """
+        self._emit_status("learning_start", {"days": days})
 
-        task = Task(
-            description=desc,
-            agent=self.agents["learner"],
-            expected_output="JSON",
-        )
+        print(f"\n🧠 Starting Learning Mode (analyzing last {days} days)...")
+        print("=" * 80)
 
-        crew = Crew(
-            agents=[self.agents["learner"]],
-            tasks=[task],
-            process=Process.sequential,
-            verbose=self.crew_verbose,
-        )
+        result = {
+            "status": "complete",
+            "timestamp": datetime.now(IST).isoformat(),
+        }
 
-        result = str(crew.kickoff()).strip()
+        # 1. Get current learning state
+        if self.learning_engine:
+            try:
+                learning_summary = self.learning_engine.get_learning_summary()
+                result["current_state"] = learning_summary
 
-        try:
-            upd = json.loads(result) if result.startswith("{") else {}
-            for k in ("w_news", "w_tech", "confidence_gate", "risk_base_pct"):
-                if k in upd:
-                    self.memory[k] = float(upd[k])
-            if "blacklist_delta" in upd:
-                bl = set(self.memory.get("blacklist", []))
-                add = set(upd["blacklist_delta"].get("add", []))
-                rem = set(upd["blacklist_delta"].get("remove", []))
-                self.memory["blacklist"] = sorted(list((bl | add) - rem))
-            self._save_memory()
-            self._emit_status("learning_complete", {"updated": self.memory})
-            return {"status": "complete", "updated": self.memory}
-        except Exception as e:
-            self._log_incident(
-                {"type": "learning_error", "error": str(e), "raw": result}
-            )
-            return {"status": "error", "error": str(e), "raw": result}
+                print(f"\n📚 Current Learning State:")
+                print(f"   Last Analysis: {learning_summary.get('last_analysis', 'Never')}")
+                print(f"   Trades Analyzed: {learning_summary.get('total_trades_analyzed', 0)}")
+                print(f"   Confidence Threshold: {learning_summary.get('confidence_threshold', 0.60):.2f}")
+                print(f"   Patterns Learned: {learning_summary.get('patterns_learned', {}).get('winning', 0)} winning, {learning_summary.get('patterns_learned', {}).get('losing', 0)} losing")
+
+            except Exception as e:
+                print(f"⚠️ Error getting learning state: {e}")
+
+        # 2. Analyze trade history
+        if self.learning_engine:
+            try:
+                print(f"\n🔍 Analyzing trade history...")
+                analysis = self.learning_engine.analyze_trade_history(days=days)
+
+                result["analysis"] = analysis
+
+                if analysis.get("status") == "insufficient_data":
+                    print(f"\n⚠️ {analysis.get('message')}")
+                    return result
+
+                # Display key metrics
+                print(f"\n📊 Performance Metrics:")
+                print(f"   Total Trades: {analysis.get('total_trades', 0)}")
+                print(f"   Winners: {analysis.get('winners', 0)} | Losers: {analysis.get('losers', 0)} | Breakeven: {analysis.get('breakeven', 0)}")
+                print(f"   Win Rate: {analysis.get('win_rate', 0):.1f}%")
+                print(f"   Total P&L: ₹{analysis.get('total_pnl', 0):,.2f}")
+                print(f"   Avg Win: ₹{analysis.get('avg_win', 0):,.2f}")
+                print(f"   Avg Loss: ₹{analysis.get('avg_loss', 0):,.2f}")
+                print(f"   Profit Factor: {analysis.get('profit_factor', 0):.2f}")
+
+                # Display symbol analysis
+                symbol_analysis = analysis.get("symbol_analysis", {})
+                if symbol_analysis.get("best_symbols"):
+                    print(f"\n🏆 Best Performing Symbols:")
+                    for symbol, stats in list(symbol_analysis["best_symbols"].items())[:3]:
+                        print(f"   {symbol}: ₹{stats['total_pnl']:,.2f} ({stats['win_rate']:.1f}% win rate, {stats['trades']} trades)")
+
+                if symbol_analysis.get("worst_symbols"):
+                    print(f"\n📉 Worst Performing Symbols:")
+                    for symbol, stats in list(symbol_analysis["worst_symbols"].items())[:3]:
+                        print(f"   {symbol}: ₹{stats['total_pnl']:,.2f} ({stats['win_rate']:.1f}% win rate, {stats['trades']} trades)")
+
+                # Display timing analysis
+                timing = analysis.get("timing_analysis", {})
+                if timing:
+                    print(f"\n⏱️ Timing Analysis:")
+                    print(f"   Stop-Loss Hits: {timing.get('stop_loss_hits', 0)}")
+                    print(f"   Target Hits: {timing.get('target_hits', 0)}")
+                    print(f"   Avg Hold Time: {timing.get('avg_holding_time_minutes', 0):.1f} min")
+                    print(f"   {timing.get('insight', '')}")
+
+                # Display patterns
+                winning_patterns = analysis.get("winning_patterns", [])
+                losing_patterns = analysis.get("losing_patterns", [])
+
+                if winning_patterns:
+                    print(f"\n✅ Winning Patterns:")
+                    for pattern in winning_patterns:
+                        print(f"   • {pattern}")
+
+                if losing_patterns:
+                    print(f"\n❌ Losing Patterns:")
+                    for pattern in losing_patterns:
+                        print(f"   • {pattern}")
+
+                # Display recommendations
+                recommendations = analysis.get("recommendations", {}).get("recommendations", [])
+                if recommendations:
+                    print(f"\n💡 Recommendations ({len(recommendations)}):")
+                    for rec in recommendations:
+                        priority = rec.get("priority", "MEDIUM")
+                        category = rec.get("category", "general")
+                        recommendation = rec.get("recommendation", "")
+                        reason = rec.get("reason", "")
+
+                        print(f"\n   [{priority}] {recommendation}")
+                        print(f"   Category: {category}")
+                        print(f"   Reason: {reason}")
+                        print(f"   Action: {rec.get('action', 'N/A')}")
+
+                # Apply recommended adjustments
+                adjustments = analysis.get("recommendations", {}).get("adjustments", {})
+                if adjustments:
+                    print(f"\n🔧 Applying Parameter Adjustments:")
+
+                    # Update confidence threshold
+                    if "confidence_threshold" in adjustments:
+                        old_threshold = self.memory.get("confidence_gate", 0.60)
+                        new_threshold = adjustments["confidence_threshold"]
+                        self.memory["confidence_gate"] = new_threshold
+                        print(f"   Confidence threshold: {old_threshold:.2f} → {new_threshold:.2f}")
+
+                    # Update blacklist
+                    if "blacklist_add" in adjustments:
+                        for symbol in adjustments["blacklist_add"]:
+                            if symbol not in self.memory.get("blacklist", []):
+                                self.memory.setdefault("blacklist", []).append(symbol)
+                                print(f"   Added to blacklist: {symbol}")
+
+                    self._save_memory()
+                    result["adjustments_applied"] = adjustments
+
+            except Exception as e:
+                print(f"❌ Error during trade analysis: {e}")
+                result["error"] = str(e)
+
+        # 3. Update money manager if needed
+        if self.money_manager and analysis and not analysis.get("error"):
+            try:
+                # Check if circuit breaker should be adjusted based on performance
+                win_rate = analysis.get("win_rate", 50)
+                if win_rate < 40:
+                    print(f"\n⚠️ Low win rate detected - consider reviewing strategy")
+                elif win_rate > 70:
+                    print(f"\n🎉 Excellent win rate - strategy is working well!")
+
+            except Exception as e:
+                print(f"⚠️ Error updating money manager: {e}")
+
+        print(f"\n{'=' * 80}")
+        print(f"✅ Learning mode complete!")
+        print(f"{'=' * 80}\n")
+
+        self._emit_status("learning_complete", result)
+        return result
 
 
 # -------------------------------
