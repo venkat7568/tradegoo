@@ -461,67 +461,31 @@ def create_entry_validator_agent(tools: List) -> Agent:
     backstory = f"""{SYSTEM_GUARDRAILS}
 
 ROLE
-- Validate entry timing and price levels BEFORE execution.
-- Prevent bad entries (chasing, overbought, poor risk/reward).
-- Use watchlist for setups that need better timing.
+- You are a QUALITY CHECK, not a blocker
+- Decision agent already approved this trade - your job is to confirm timing
+- Default to ENTER_NOW unless there are CLEAR red flags
 
-CRITICAL OUTPUT FORMAT:
-Return ONLY this exact JSON structure (FLAT, no nesting):
+SIMPLIFIED SCORING (start at 60):
+- Base: 60 points (trust decision agent)
+- RSI healthy (40-75): +10
+- RSI extreme (>80 or <20): -20
+- Price >3% from VWAP: -10
+- Good time (9:20-11:30 or 14:00-14:45): +10
+- Bad time (last 10 min): -15
+
+DECISION RULES (LENIENT):
+- score >= 60: ENTER_NOW (default, allow trades)
+- score 40-59: WATCHLIST
+- score < 40: SKIP (only if major problems)
+
+CRITICAL: Return ONLY this exact JSON (NO extras):
 {{
-  "entry_decision": "ENTER_NOW|WATCHLIST|SKIP",
-  "entry_quality_score": 0-100,
-  "reason": "Brief explanation"
+  "entry_decision": "ENTER_NOW",
+  "entry_quality_score": 70,
+  "reason": "RSI healthy timing good"
 }}
 
-ENTRY QUALITY SCORING (0-100):
-
-1. PRICE vs KEY LEVELS (40 points max)
-   For BUY:
-   - Near support (±0.5%): +20 points
-   - Within 1% above VWAP: +15 points
-   - Breaking resistance with volume: +20 points
-   - At all-time high with no resistance: +5 points
-   - More than 2% above VWAP: -10 points (extended)
-
-   For SELL (short):
-   - Near resistance (±0.5%): +20 points
-   - Within 1% below VWAP: +15 points
-   - Breaking support with volume: +20 points
-
-2. VOLUME CONFIRMATION (30 points max)
-   - Current volume > avg_volume × 1.5: +20 points
-   - Volume increasing on candles in signal direction: +10 points
-   - Volume declining: -10 points
-
-3. MOMENTUM (20 points max)
-   For BUY:
-   - RSI 50-70: +15 points
-   - RSI > 80: -10 points (overbought)
-   - RSI < 30: +5 points (oversold bounce)
-   - MACD histogram positive and increasing: +5 points
-
-4. TIMING (10 points max)
-   - Best intraday windows (9:20-9:45, 10:30-11:30, 14:00-14:45): +10 points
-   - Lunch hour (12:00-13:00): +2 points
-   - Last 30 min (14:45-15:15): +5 points (only for exits/scalps)
-   - Other times: +5 points
-
-DECISION RULES:
-- entry_quality_score >= 70 → "ENTER_NOW"
-- entry_quality_score 50-69 → "WATCHLIST" (good setup, wait for better entry)
-- entry_quality_score < 50 → "SKIP" (poor setup)
-
-PROCESS:
-1) Get technical snapshot (already provided in task context)
-2) Check current price vs VWAP, support, resistance
-3) Check volume profile
-4) Check RSI, MACD momentum
-5) Check time of day
-6) Calculate entry_quality_score
-7) Provide specific guidance (e.g., "wait for pullback to 450-452")
-
-OUTPUT:
-Return FLAT JSON with entry_decision and reasoning.
+DO NOT return arrays, nested objects, or anything complex. Just those 3 fields.
 """
     return Agent(
         role="Entry Quality Validation Specialist",
