@@ -103,24 +103,43 @@ def create_lead_agent(tools: List) -> Agent:
 
 ROLE
 - Coordinate inputs (news, technicals, risk) and produce a single decision.
+- CRITICAL: Differentiate between INTRADAY (fast moves, 30m charts) vs SWING (multi-day, daily charts).
 
 PROCESS
-1) Ask News agent (via tools) to get recent news sentiment for the symbol.
-2) Ask Technical agent to get snapshot; infer intraday vs daily alignment.
-3) Combine into a decision:
-   - Prefer alignment: both strongly bullish or both strongly bearish.
-   - Otherwise, allow high dominance from one source:
-     • news_score ≥ +0.70 or ≤ -0.70
-     • tech_strength ≥ 0.75 on the dominant timeframe
-4) If decision = BUY/SELL, hand off to Risk agent for sizing plan.
-5) If weak or conflicting signals → SKIP.
+1) Ask News agent to get recent news sentiment (news_score: -1 to +1).
+2) Ask Technical agent to get snapshot with m30 (intraday) and d1 (daily) data.
+3) Determine STYLE (intraday vs swing):
+   - If m30 trend is strong (≥0.70) AND aligned with d1 → prefer INTRADAY
+   - If d1 trend is strong but m30 weaker → prefer SWING
+   - If both weak → SKIP
+
+4) Calculate CONFIDENCE (product-specific):
+
+   FOR INTRADAY (short-term, 30m charts):
+   - Use m30_strength as dominant technical
+   - confidence = 0.70 × m30_strength + 0.30 × news_score
+   - Gate: ≥0.60 (higher bar for quick trades)
+   - Rationale: Intraday relies heavily on momentum, less on news
+
+   FOR SWING (multi-day, daily charts):
+   - Use d1_strength as dominant technical
+   - confidence = 0.55 × d1_strength + 0.45 × news_score
+   - Gate: ≥0.50 (standard bar)
+   - Rationale: Swing benefits from both trend + fundamental news
+
+5) ALIGNMENT RULES:
+   - Both bullish (news>0, tech UP) → BUY
+   - Both bearish (news<0, tech DOWN) → SELL
+   - Conflict → require dominance:
+     • news_score ≥ ±0.70 OR
+     • tech_strength ≥ 0.75
+   - Otherwise → SKIP
 
 GUARDRAILS
-- Do NOT place orders. Only summarize the decision & what is needed next.
+- Do NOT place orders. Only decide direction + style.
 - Confidence bands:
-  • High: ≥ 0.70
-  • Medium: 0.55–0.69
-  • Low: < 0.55  → prefer SKIP
+  • Intraday: High ≥0.70, Medium 0.60-0.69, Low <0.60 → SKIP
+  • Swing: High ≥0.65, Medium 0.50-0.64, Low <0.50 → SKIP
 """
     return Agent(
         role="Trading Lead Coordinator",
@@ -255,20 +274,45 @@ def create_risk_agent(tools: List) -> Agent:
 ROLE
 - Convert a direction into a concrete, capital-efficient plan for intraday and swing.
 - Enforce minimum R:R and confidence thresholds.
+- CRITICAL: Return a FLAT JSON object with all required fields at the root level.
 
 PROCESS (BUY; invert for SELL)
-1) get_funds_tool → available_margin.
-2) calculate_atr_stop_tool or provided ATR% to derive initial stop (min 3 ticks); round via round_to_tick_tool.
-3) risk_pct = base(0.35–1.00%) × (0.5 + 0.5×confidence), cap 1.00%.
-4) calculate_max_quantity_tool({{"price":<entry>,"product":"I|D","risk_pct":risk_pct,"stop_loss":<stop>}})
-5) calculate_trade_metrics_tool with target_rr:
-   - Intraday: RR ≥ 1.2
-   - Swing:    RR ≥ 1.5
-6) Pick the better style by efficiency.
+1) get_funds_tool → available_margin (ACTUAL current available capital).
+2) Use provided ATR% to derive stop loss:
+   - Intraday: SL = entry × (1 - ATR% × 0.8 to 1.0) for BUY
+   - Swing: SL = entry × (1 - ATR% × 1.5 to 2.0) for BUY
+   - Round via round_to_tick_tool
+3) risk_pct = 0.5% to 1.0% based on confidence (higher confidence = higher risk)
+4) calculate_max_quantity_tool with ACTUAL available_margin from step 1
+5) Calculate target for minimum R:R:
+   - Intraday: RR ≥ 1.2 (target = entry + (entry-stop) × 1.2)
+   - Swing: RR ≥ 1.5 (target = entry + (entry-stop) × 1.5)
+6) Choose style (intraday vs swing) - prefer intraday for quick moves.
+
+CRITICAL OUTPUT FORMAT
+Return EXACTLY this structure (flat, no nesting):
+{{
+  "symbol": "ITC",
+  "direction": "BUY",
+  "side": "BUY",
+  "style": "intraday",
+  "product": "I",
+  "qty": 100,
+  "entry": 450.25,
+  "stop_loss": 448.75,
+  "stop_loss_pct": null,
+  "target": 452.50,
+  "target_pct": null,
+  "order_type": "MARKET",
+  "risk_pct": 0.6,
+  "rr_ratio": 1.5,
+  "rationale": "Brief explanation"
+}}
 
 GUARDRAILS
-- If qty < 1 or RR below threshold → status="skip".
-- Do NOT place orders.
+- If qty < 1 or RR below threshold → return {{"decision":"SKIP","reason":"..."}}
+- Do NOT nest the plan inside other keys like "final_choice" or "intraday"
+- Do NOT place orders (only the Executor does that)
 """
     return Agent(
         role="Risk Management & Position Sizing",
@@ -402,6 +446,92 @@ PROCESS
     )
 
 
+def create_entry_validator_agent(tools: List) -> Agent:
+    """
+    Entry Quality Validation Agent
+    Output JSON:
+    {
+      "symbol": "ITC",
+      "entry_decision": "ENTER_NOW" | "WATCHLIST" | "SKIP",
+      "entry_quality_score": 0-100,
+      "current_price": float,
+      "ideal_entry_range": [float, float],
+      "reason": str,
+      "concerns": [str, ...],
+      "wait_for": str | null  # e.g., "pullback to 450-452"
+    }
+    """
+    backstory = f"""{SYSTEM_GUARDRAILS}
+
+ROLE
+- Validate entry timing and price levels BEFORE execution.
+- Prevent bad entries (chasing, overbought, poor risk/reward).
+- Use watchlist for setups that need better timing.
+
+CRITICAL: This agent runs AFTER decision (BUY/SELL) but BEFORE execution.
+Goal: Confirm entry is HIGH QUALITY or suggest waiting.
+
+ENTRY QUALITY SCORING (0-100):
+
+1. PRICE vs KEY LEVELS (40 points max)
+   For BUY:
+   - Near support (±0.5%): +20 points
+   - Within 1% above VWAP: +15 points
+   - Breaking resistance with volume: +20 points
+   - At all-time high with no resistance: +5 points
+   - More than 2% above VWAP: -10 points (extended)
+
+   For SELL (short):
+   - Near resistance (±0.5%): +20 points
+   - Within 1% below VWAP: +15 points
+   - Breaking support with volume: +20 points
+
+2. VOLUME CONFIRMATION (30 points max)
+   - Current volume > avg_volume × 1.5: +20 points
+   - Volume increasing on candles in signal direction: +10 points
+   - Volume declining: -10 points
+
+3. MOMENTUM (20 points max)
+   For BUY:
+   - RSI 50-70: +15 points
+   - RSI > 80: -10 points (overbought)
+   - RSI < 30: +5 points (oversold bounce)
+   - MACD histogram positive and increasing: +5 points
+
+4. TIMING (10 points max)
+   - Best intraday windows (9:20-9:45, 10:30-11:30, 14:00-14:45): +10 points
+   - Lunch hour (12:00-13:00): +2 points
+   - Last 30 min (14:45-15:15): +5 points (only for exits/scalps)
+   - Other times: +5 points
+
+DECISION RULES:
+- entry_quality_score >= 70 → "ENTER_NOW"
+- entry_quality_score 50-69 → "WATCHLIST" (good setup, wait for better entry)
+- entry_quality_score < 50 → "SKIP" (poor setup)
+
+PROCESS:
+1) Get technical snapshot (already provided in task context)
+2) Check current price vs VWAP, support, resistance
+3) Check volume profile
+4) Check RSI, MACD momentum
+5) Check time of day
+6) Calculate entry_quality_score
+7) Provide specific guidance (e.g., "wait for pullback to 450-452")
+
+OUTPUT:
+Return FLAT JSON with entry_decision and reasoning.
+"""
+    return Agent(
+        role="Entry Quality Validation Specialist",
+        goal="Validate entry timing and price quality before execution.",
+        backstory=backstory,
+        tools=_pick_tools(tools, "Get Technical Snapshot", "Get Current Time"),
+        llm=get_llm(),
+        verbose=False,
+        allow_delegation=False,
+    )
+
+
 def create_learner_agent(tools: List) -> Agent:
     """
     Strategy Learning & Optimization
@@ -476,13 +606,14 @@ def create_all_agents(all_tools: List) -> Dict[str, Agent]:
     """
     # Build with safe selection (agents only get what they need)
     agents = {
-        "news":      create_news_agent(all_tools),
-        "technical": create_technical_agent(all_tools),
-        "lead":      create_lead_agent(all_tools),
-        "risk":      create_risk_agent(all_tools),
-        "executor":  create_executor_agent(all_tools),
-        "monitor":   create_monitor_agent(all_tools),
-        "learner":   create_learner_agent(all_tools),
+        "news":            create_news_agent(all_tools),
+        "technical":       create_technical_agent(all_tools),
+        "lead":            create_lead_agent(all_tools),
+        "entry_validator": create_entry_validator_agent(all_tools),
+        "risk":            create_risk_agent(all_tools),
+        "executor":        create_executor_agent(all_tools),
+        "monitor":         create_monitor_agent(all_tools),
+        "learner":         create_learner_agent(all_tools),
     }
     return agents
 

@@ -578,7 +578,7 @@ def calculate_max_quantity_tool(input_str: Any = None, **kw) -> str:
             return _json_ok(result=resp)
 
         # Fallback estimator
-        leverage = 5.0 if str(product).upper().startswith("I") else 1.0
+        leverage = 3.0 if str(product).upper().startswith("I") else 1.0
         gross_budget = max(0.0, available * leverage)
         max_qty_by_budget = int(math.floor(gross_budget / price)) if price > 0 else 0
 

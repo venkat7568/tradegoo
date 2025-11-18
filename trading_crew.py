@@ -339,6 +339,88 @@ Return JSON only:
         return actions
 
     # -------------------------------
+    # Intraday square-off (time-based)
+    # -------------------------------
+    def square_off_intraday_positions(self) -> List[Dict[str, Any]]:
+        """
+        Square off all intraday positions before market close (3:15 PM IST).
+        Call this method during the trading session if current time > 3:10 PM.
+        """
+        now = datetime.now(IST)
+        square_off_time = now.replace(hour=15, minute=10, second=0, microsecond=0)
+
+        # Only square off after 3:10 PM
+        if now < square_off_time:
+            return []
+
+        print(f"\n⏰ Time: {now.strftime('%H:%M:%S')} - Squaring off intraday positions...")
+        self._emit_status("intraday_square_off_start", {"time": now.isoformat()})
+
+        squared_positions = []
+
+        if not self.operator:
+            print("⚠️ Operator not available, cannot square off")
+            return []
+
+        try:
+            # Get current positions
+            pos_data = self.operator.get_positions(include_closed=False)
+            positions = pos_data.get("positions", [])
+
+            intraday_positions = [
+                p for p in positions
+                if p.get("product", "").upper() == "I" and int(p.get("quantity", 0) or 0) != 0
+            ]
+
+            if not intraday_positions:
+                print("✅ No intraday positions to square off")
+                return []
+
+            print(f"📊 Found {len(intraday_positions)} intraday position(s) to square off")
+
+            for pos in intraday_positions:
+                symbol = pos.get("tradingsymbol") or pos.get("symbol", "UNKNOWN")
+                instrument_key = pos.get("instrument_token") or pos.get("instrument_key")
+
+                try:
+                    print(f"🔄 Squaring off {symbol}...")
+                    result = self.operator.square_off(
+                        symbol=symbol,
+                        instrument_key=instrument_key,
+                        live=self.live,
+                    )
+
+                    squared_positions.append({
+                        "symbol": symbol,
+                        "result": result,
+                        "time": now.isoformat(),
+                    })
+
+                    if result.get("status") == "ok":
+                        print(f"✅ {symbol} squared off successfully")
+                    else:
+                        print(f"⚠️ {symbol} square-off failed: {result.get('message', 'unknown')}")
+
+                except Exception as e:
+                    print(f"❌ Error squaring off {symbol}: {e}")
+                    squared_positions.append({
+                        "symbol": symbol,
+                        "error": str(e),
+                        "time": now.isoformat(),
+                    })
+
+            self._emit_status("intraday_square_off_complete", {
+                "count": len(squared_positions),
+                "results": squared_positions,
+            })
+
+        except Exception as e:
+            print(f"❌ Error during square-off: {e}")
+            self._emit_status("intraday_square_off_error", {"error": str(e)})
+
+        return squared_positions
+
+    # -------------------------------
     # Decision (news + tech)
     # -------------------------------
     def decide_trade(self, symbol: str) -> Dict[str, Any]:
@@ -393,14 +475,32 @@ Return JSON only:
 Memory:
 $memory
 
-Rules:
-1) If both align → use that direction.
-2) If conflict → require dominance (news ≥ 0.7 OR tech ≥ 0.75).
-3) confidence = w_tech*tech_strength*dir_sign + w_news*news_score, clamp [0,1].
-4) Gate: confidence >= $gate else SKIP.
+CRITICAL: Determine STYLE (intraday vs swing) based on timeframe strengths.
 
-Return JSON only:
-{"direction":"BUY|SELL|SKIP","confidence":0..1,"rationale":"..."}
+STYLE SELECTION:
+- If m30_strength ≥ 0.70 AND aligned with d1 → style="intraday"
+- If d1_strength strong but m30 weaker → style="swing"
+- If both weak → SKIP
+
+CONFIDENCE CALCULATION (product-specific):
+
+FOR INTRADAY:
+- confidence = 0.70 × m30_strength + 0.30 × news_score
+- Gate: ≥0.60 (higher bar)
+
+FOR SWING:
+- confidence = 0.55 × d1_strength + 0.45 × news_score
+- Gate: ≥0.50
+
+ALIGNMENT:
+1) Both align (news + tech same direction) → use that direction
+2) Conflict → require dominance:
+   - news_score ≥ ±0.70 OR
+   - tech_strength ≥ 0.75
+3) Otherwise → SKIP
+
+Return JSON only (include style!):
+{"direction":"BUY|SELL|SKIP","confidence":0..1,"style":"intraday|swing","rationale":"..."}
 """,
             symbol=symbol,
             memory=mem_view,
@@ -504,7 +604,138 @@ Return JSON only:
                 "error": str(e),
             }
 
-        # 2) Ask Risk agent for a plan
+        # 2) 🆕 ENTRY VALIDATION - Check if NOW is a good time to enter
+        self._emit_status("entry_validation_start", {"symbol": symbol, "direction": direction})
+
+        entry_validation_desc = _tmpl(
+            """Validate entry quality for $symbol.
+
+Decision: $direction (confidence: $confidence)
+Technical Snapshot: $snapshot
+
+Your job: Determine if RIGHT NOW is a good time to enter this trade.
+
+CRITICAL SCORING CRITERIA:
+1. Price vs Key Levels (40 pts)
+   - Near support/VWAP for BUY: +20 pts
+   - Extended >2% above VWAP: -10 pts
+   - Breakout with volume: +20 pts
+
+2. Volume (30 pts)
+   - High volume confirmation: +20 pts
+   - Volume increasing: +10 pts
+
+3. Momentum (20 pts)
+   - RSI 50-70 for BUY: +15 pts
+   - RSI >80: -10 pts (overbought)
+
+4. Timing (10 pts)
+   - Best windows (9:20-9:45, 10:30-11:30): +10 pts
+   - Other times: +5 pts
+
+Return JSON:
+{
+  "entry_decision": "ENTER_NOW" | "WATCHLIST" | "SKIP",
+  "entry_quality_score": <0-100>,
+  "reason": "Brief explanation",
+  "wait_for": "pullback to 120-121" (if WATCHLIST)
+}
+
+RULES:
+- Score ≥70: ENTER_NOW
+- Score 50-69: WATCHLIST (good signal, but wait for better entry)
+- Score <50: SKIP
+""",
+            symbol=symbol,
+            direction=direction,
+            confidence=f"{confidence:.3f}",
+            snapshot=tech_snap,
+        )
+
+        entry_task = Task(
+            description=entry_validation_desc,
+            agent=self.agents["entry_validator"],
+            expected_output="JSON",
+        )
+
+        entry_crew = Crew(
+            agents=[self.agents["entry_validator"]],
+            tasks=[entry_task],
+            process=Process.sequential,
+            verbose=False,
+        )
+
+        entry_result_str = str(entry_crew.kickoff()).strip()
+        self._emit_status("entry_validation_complete", {"symbol": symbol, "result": entry_result_str})
+
+        # Parse entry validation result
+        try:
+            entry_validation = (
+                json.loads(entry_result_str) if entry_result_str.lstrip().startswith("{") else {}
+            )
+            entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
+            entry_quality = int(entry_validation.get("entry_quality_score") or 0)
+            entry_reason = entry_validation.get("reason", "")
+
+            print(f"📊 Entry Quality: {entry_quality}/100 → {entry_decision}")
+            print(f"   Reason: {entry_reason}")
+
+            if entry_decision == "SKIP":
+                return {
+                    "symbol": symbol,
+                    "status": "skipped",
+                    "reason": "entry_quality_too_low",
+                    "entry_quality_score": entry_quality,
+                    "entry_reason": entry_reason,
+                }
+
+            elif entry_decision == "WATCHLIST":
+                # Add to watchlist for monitoring
+                print(f"📋 Adding {symbol} to watchlist (quality: {entry_quality})")
+                wait_for = entry_validation.get("wait_for", "better entry")
+
+                # Import and use watchlist manager
+                try:
+                    from watchlist_manager import get_watchlist_manager
+                    wm = get_watchlist_manager()
+                    wm.add_to_intraday_watchlist(
+                        symbol=symbol,
+                        signal=direction,
+                        reason=entry_reason,
+                        entry_target=None,  # Could parse from wait_for
+                        current_price=tech_snap.get("current_price"),
+                        confidence=confidence,
+                        entry_quality=entry_quality,
+                        setup_type="pending_entry",
+                        technical_data=tech_snap,
+                    )
+                    print(f"✅ {symbol} added to watchlist: {wait_for}")
+                except Exception as e:
+                    print(f"⚠️ Error adding to watchlist: {e}")
+
+                return {
+                    "symbol": symbol,
+                    "status": "watchlisted",
+                    "reason": "waiting_for_better_entry",
+                    "entry_quality_score": entry_quality,
+                    "wait_for": wait_for,
+                    "entry_reason": entry_reason,
+                }
+
+            # If ENTER_NOW, continue to sizing & execution
+            print(f"✅ Entry validated - proceeding with execution")
+
+        except Exception as e:
+            print(f"⚠️ Entry validation parse error: {e}")
+            # If validation fails, default to cautious (skip)
+            return {
+                "symbol": symbol,
+                "status": "skipped",
+                "reason": "entry_validation_parse_error",
+                "error": str(e),
+            }
+
+        # 3) Ask Risk agent for a plan
         risk_desc = _tmpl(
             """Build position plan for $symbol.
 
@@ -513,31 +744,39 @@ Inputs:
 - Confidence: $confidence
 - Technical Snapshot: $snapshot
 
-Steps:
-1) Derive ATR-based SL: intraday ≈ 0.8–1.2 × ATR%, swing ≈ 1.2–2.0 × ATR%, min 3 ticks (0.15).
-2) Get funds → compute feasible qty with margin model.
-3) Propose BOTH plans:
-   - Intraday: product="I", RR≥1.2
-   - Swing:    product="D", RR≥1.5
-4) Pick higher efficiency = confidence × (exp_profit/capital)/time_days.
-5) Return JSON plan (you may include both, but clearly mark the final choice):
+CRITICAL INSTRUCTIONS:
+1) Call get_funds_tool FIRST to get ACTUAL available capital (do NOT assume or hallucinate amounts)
+2) Use current_price from snapshot as entry price
+3) Calculate stop_loss from ATR:
+   - For intraday: stop_loss = entry × (1 - atr_pct/100 × 0.9) for BUY
+   - For swing: stop_loss = entry × (1 - atr_pct/100 × 1.8) for BUY
+4) Call calculate_max_quantity_tool with the ACTUAL available_margin from step 1
+5) Calculate target for minimum R:R:
+   - Intraday: target = entry + (entry - stop_loss) × 1.3
+   - Swing: target = entry + (entry - stop_loss) × 1.6
+6) Return a FLAT JSON object (NO NESTING!)
+
+REQUIRED OUTPUT FORMAT (must be flat, all fields at root level):
 {
-  "style":"intraday|swing",
-  "product":"I|D",
-  "direction":"BUY|SELL",
-  "side":"BUY|SELL",
-  "qty":<int>,
-  "entry":<float>,
-  "stop_loss":<float>|null,
-  "stop_loss_pct":<float>|null,
-  "target":<float>|null,
-  "target_pct":<float>|null,
-  "order_type":"MARKET|LIMIT",
-  "rationale":"..."
+  "symbol": "$symbol",
+  "direction": "$direction",
+  "side": "$direction",
+  "style": "intraday",
+  "product": "I",
+  "qty": <integer from calculate_max_quantity_tool>,
+  "entry": <float from snapshot>,
+  "stop_loss": <float calculated above>,
+  "target": <float calculated above>,
+  "order_type": "MARKET",
+  "rr_ratio": <float>,
+  "rationale": "Brief 1-line explanation"
 }
 
-If not feasible → {"decision":"SKIP","reason":"..."}.
-Always return exactly ONE JSON object, no text outside JSON.
+IMPORTANT:
+- Do NOT nest inside "final_choice", "plan", "intraday", or "swing" keys
+- Do NOT include alternative plans in the response
+- If qty < 1 → return {"decision":"SKIP","reason":"insufficient_capital"}
+- Use get_funds_tool to get real available margin (not hardcoded values!)
 """,
             symbol=symbol,
             direction=direction,
@@ -707,14 +946,91 @@ Return only JSON like:
             "holdings_review": [],
             "decisions": [],
             "executions": [],
+            "capital_tracking": {
+                "initial_capital": 0.0,
+                "final_capital": 0.0,
+                "used_capital": 0.0,
+                "max_positions": int(os.environ.get("MAX_POSITIONS", "5")),
+            },
         }
+
+        # Get initial capital
+        try:
+            if self.operator:
+                funds = self.operator.get_funds()
+                initial_capital = float(
+                    (funds.get("equity") or {}).get("available_margin", 0) or 0
+                )
+                cycle_results["capital_tracking"]["initial_capital"] = initial_capital
+                print(f"💰 Starting capital: ₹{initial_capital:,.2f}")
+            else:
+                initial_capital = 0.0
+                print("⚠️ Operator not available, capital tracking disabled")
+        except Exception as e:
+            print(f"⚠️ Error fetching initial capital: {e}")
+            initial_capital = 0.0
 
         holdings_actions = self.review_holdings()
         cycle_results["holdings_review"] = holdings_actions
 
+        # Square off intraday positions if near market close (after 3:10 PM)
+        intraday_square_offs = self.square_off_intraday_positions()
+        if intraday_square_offs:
+            cycle_results["intraday_square_offs"] = intraday_square_offs
+
+        # Track positions and capital usage
+        executed_positions = 0
+        max_positions = cycle_results["capital_tracking"]["max_positions"]
+        capital_utilization_limit = float(os.environ.get("MAX_CAPITAL_UTILIZATION", "0.90"))
+
         for symbol in symbols:
             try:
-                print(f"\n{'=' * 80}\n🎯 Processing {symbol}\n{'=' * 80}")
+                # Check position limits BEFORE processing
+                if executed_positions >= max_positions:
+                    print(f"⚠️ Max positions ({max_positions}) reached, skipping remaining symbols")
+                    self._emit_status(
+                        "max_positions_reached",
+                        {"executed": executed_positions, "max": max_positions},
+                    )
+                    break
+
+                # Check capital availability BEFORE processing
+                if self.operator and initial_capital > 0:
+                    try:
+                        current_funds = self.operator.get_funds()
+                        current_available = float(
+                            (current_funds.get("equity") or {}).get("available_margin", 0) or 0
+                        )
+                        used_capital = initial_capital - current_available
+                        utilization = used_capital / initial_capital if initial_capital > 0 else 0
+
+                        print(
+                            f"💰 Capital: ₹{current_available:,.2f} available "
+                            f"(used: ₹{used_capital:,.2f}, {utilization:.1%})"
+                        )
+
+                        if utilization >= capital_utilization_limit:
+                            print(
+                                f"⚠️ Capital utilization {utilization:.1%} >= {capital_utilization_limit:.1%}, "
+                                f"stopping new trades"
+                            )
+                            self._emit_status(
+                                "capital_exhausted",
+                                {
+                                    "utilization": utilization,
+                                    "limit": capital_utilization_limit,
+                                },
+                            )
+                            break
+
+                        if current_available < 1000:  # Minimum ₹1000 required
+                            print(f"⚠️ Insufficient capital (₹{current_available:,.2f} < ₹1,000), stopping")
+                            break
+
+                    except Exception as e:
+                        print(f"⚠️ Error checking capital: {e}")
+
+                print(f"\n{'=' * 80}\n🎯 Processing {symbol} (Position {executed_positions + 1}/{max_positions})\n{'=' * 80}")
                 decision = self.decide_trade(symbol)
                 cycle_results["decisions"].append(decision)
 
@@ -727,6 +1043,19 @@ Return only JSON like:
                         symbol, decision["direction"], confidence
                     )
                     cycle_results["executions"].append(execution)
+
+                    # Track executed positions
+                    if execution.get("status") not in ("skipped", "error"):
+                        # Check if execution has order details indicating success
+                        exec_data = execution.get("execution")
+                        if isinstance(exec_data, str):
+                            try:
+                                exec_data = json.loads(exec_data)
+                            except Exception:
+                                pass
+                        if isinstance(exec_data, dict) and exec_data.get("status") in ("success", "ok"):
+                            executed_positions += 1
+                            print(f"✅ Position opened: {executed_positions}/{max_positions}")
 
                 time.sleep(0.4)
 
@@ -746,6 +1075,21 @@ Return only JSON like:
                         "error": str(e),
                     }
                 )
+
+        # Final capital tracking
+        if self.operator and initial_capital > 0:
+            try:
+                final_funds = self.operator.get_funds()
+                final_capital = float(
+                    (final_funds.get("equity") or {}).get("available_margin", 0) or 0
+                )
+                cycle_results["capital_tracking"]["final_capital"] = final_capital
+                cycle_results["capital_tracking"]["used_capital"] = (
+                    initial_capital - final_capital
+                )
+                print(f"\n💰 Final capital: ₹{final_capital:,.2f} (used: ₹{initial_capital - final_capital:,.2f})")
+            except Exception as e:
+                print(f"⚠️ Error fetching final capital: {e}")
 
         cycle_results["end_time"] = datetime.now(IST).isoformat()
         self._save_decisions(cycle_results)
