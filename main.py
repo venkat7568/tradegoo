@@ -482,6 +482,44 @@ def discover_and_validate_symbols(mode, date):
 
     if not validated:
         emit_status("⚠️ No tradable NSE/BSE equities could be resolved from today's news.")
+
+        # FALLBACK: Use popular liquid NSE stocks when news discovery fails (especially for backtest)
+        emit_status("🔄 Falling back to popular NSE stocks for analysis...")
+        fallback_symbols = [
+            "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+            "HINDUNILVR", "ITC", "SBIN", "BHARTIARTL", "KOTAKBANK",
+            "LT", "AXISBANK", "ASIANPAINT", "MARUTI", "TITAN"
+        ]
+
+        for sym in fallback_symbols:
+            try:
+                row = tech_client.resolve(sym)
+                if not row:
+                    continue
+
+                ik = row.get("instrument_key")
+                if not ik or not ik.startswith(("NSE_EQ|", "BSE_EQ|")):
+                    continue
+                if ik in seen_ik:
+                    continue
+
+                seen_ik.add(ik)
+                validated.append({
+                    "symbol": row.get("symbol") or sym,
+                    "name": row.get("name") or sym,
+                    "instrument_key": ik,
+                    "source": "fallback"
+                })
+
+                if len(validated) >= MAX_DISCOVERED_SYMBOLS:
+                    break
+            except Exception:
+                continue
+
+        if validated:
+            emit_status(f"✅ Using {len(validated)} fallback symbols for analysis")
+        else:
+            emit_status("❌ Fallback also failed - no symbols available")
     else:
         emit_status(f"🎉 Discovered {len(validated)} symbols from news for this cycle")
 

@@ -54,7 +54,7 @@ except Exception:
 
 
 # ---------- utils ----------
-def _mk_logger(name: str, level_env: str = "TECH_LOG_LEVEL", default_level: str = "INFO") -> logging.Logger:
+def _mk_logger(name: str, level_env: str = "TECH_LOG_LEVEL", default_level: str = "WARNING") -> logging.Logger:
     log = logging.getLogger(name)
     if not log.handlers:
         h = logging.StreamHandler()
