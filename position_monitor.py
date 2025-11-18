@@ -86,182 +86,304 @@ class PositionMonitor:
         Returns:
             Summary of actions taken
         """
-        if not self.operator or not self.tech:
-            return {"error": "operator_or_tech_not_available"}
+        if not self.tech:
+            return {"error": "tech_client_not_available"}
 
         try:
-            # Get positions from broker
-            positions_data = self.operator.get_positions(include_closed=False)
-            broker_positions = positions_data.get("positions", [])
+            # In backtest/paper mode, use trade tracker as primary source
+            # In live mode, use broker positions
+            if not live and self.tracker:
+                # Backtest/paper trading mode: use tracker positions
+                tracked_open = self.tracker.get_open_positions()
 
-            if not broker_positions:
-                logger.info("No open positions to monitor")
-                return {
-                    "open_positions": 0,
-                    "actions_taken": [],
-                    "message": "no_open_positions"
-                }
-
-            # Get tracked positions (with SL/target info)
-            tracked_positions = {}
-            if self.tracker:
-                for pos in self.tracker.get_open_positions():
-                    symbol = pos.get("symbol")
-                    if symbol:
-                        tracked_positions[symbol] = pos
-
-            actions_taken = []
-            positions_checked = 0
-
-            for broker_pos in broker_positions:
-                symbol = broker_pos.get("tradingsymbol") or broker_pos.get("symbol")
-                if not symbol:
-                    continue
-
-                instrument_key = broker_pos.get("instrument_token") or broker_pos.get("instrument_key")
-                quantity = int(broker_pos.get("quantity", 0) or 0)
-                product = broker_pos.get("product", "I").upper()
-
-                if quantity == 0:
-                    continue
-
-                positions_checked += 1
-
-                # Get current price
-                try:
-                    current_price, _ = self.tech.ltp(instrument_key)
-                    if current_price is None:
-                        logger.warning(f"Could not get LTP for {symbol}")
-                        continue
-                    current_price = float(current_price)
-                except Exception as e:
-                    logger.error(f"Error getting price for {symbol}: {e}")
-                    continue
-
-                # Check if we have tracking info for this position
-                tracked = tracked_positions.get(symbol)
-                if not tracked:
-                    logger.warning(f"Position {symbol} not found in tracker - cannot check SL/target")
-                    continue
-
-                # Get SL and target from tracked position
-                stop_loss = tracked.get("stop_loss")
-                target = tracked.get("target")
-                side = tracked.get("side", "BUY").upper()
-                entry_price = tracked.get("entry_price", 0)
-
-                # Check for exit conditions
-                exit_reason = None
-                should_exit = False
-
-                # Check stop-loss
-                if stop_loss:
-                    if side == "BUY" and current_price <= stop_loss:
-                        exit_reason = "STOP_LOSS_HIT"
-                        should_exit = True
-                        logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} <= {stop_loss:.2f}")
-                    elif side == "SELL" and current_price >= stop_loss:
-                        exit_reason = "STOP_LOSS_HIT"
-                        should_exit = True
-                        logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} >= {stop_loss:.2f}")
-
-                # Check target
-                if not should_exit and target:
-                    if side == "BUY" and current_price >= target:
-                        exit_reason = "TARGET_HIT"
-                        should_exit = True
-                        logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} >= {target:.2f}")
-                    elif side == "SELL" and current_price <= target:
-                        exit_reason = "TARGET_HIT"
-                        should_exit = True
-                        logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} <= {target:.2f}")
-
-                # Check time-based exit for intraday (after 3:15 PM)
-                if not should_exit and product == "I":
-                    now = datetime.now(IST)
-                    square_off_time = now.replace(hour=15, minute=15, second=0, microsecond=0)
-                    if now >= square_off_time:
-                        exit_reason = "INTRADAY_TIME_BASED_EXIT"
-                        should_exit = True
-                        logger.info(f"⏰ {symbol} Intraday time-based exit (after 3:15 PM)")
-
-                # Execute exit if needed
-                if should_exit:
-                    action_result = {
-                        "symbol": symbol,
-                        "exit_reason": exit_reason,
-                        "current_price": current_price,
-                        "entry_price": entry_price,
-                        "stop_loss": stop_loss,
-                        "target": target,
-                        "timestamp": datetime.now(IST).isoformat(),
+                if not tracked_open:
+                    logger.info("No open positions to monitor")
+                    return {
+                        "open_positions": 0,
+                        "actions_taken": [],
+                        "message": "no_open_positions"
                     }
 
-                    if live:
-                        # Place square-off order
+                actions_taken = []
+                positions_checked = 0
+
+                for tracked in tracked_open:
+                    symbol = tracked.get("symbol")
+                    if not symbol:
+                        continue
+
+                    positions_checked += 1
+
+                    # Get current price (for backtest, use historical data or simulated price)
+                    try:
+                        # Try to get current price from tech client
+                        instrument_key = tracked.get("instrument_key") or symbol
+                        current_price, _ = self.tech.ltp(instrument_key)
+                        if current_price is None:
+                            # In backtest mode, if LTP fails, skip this position
+                            logger.warning(f"Could not get LTP for {symbol} in backtest mode")
+                            continue
+                        current_price = float(current_price)
+                    except Exception as e:
+                        logger.error(f"Error getting price for {symbol}: {e}")
+                        continue
+
+                    # Get position details from tracker
+                    stop_loss = tracked.get("stop_loss")
+                    target = tracked.get("target")
+                    side = tracked.get("side", "BUY").upper()
+                    entry_price = tracked.get("entry_price", 0)
+                    quantity = tracked.get("quantity", 0)
+                    product = tracked.get("product", "I").upper()
+                    trade_id = tracked.get("trade_id")
+
+                    # Check for exit conditions
+                    exit_reason = None
+                    should_exit = False
+
+                    # Check SL/Target hits
+                    if side == "BUY":
+                        if stop_loss and current_price <= stop_loss:
+                            should_exit = True
+                            exit_reason = "STOP_LOSS"
+                        elif target and current_price >= target:
+                            should_exit = True
+                            exit_reason = "TARGET"
+                    elif side == "SELL":
+                        if stop_loss and current_price >= stop_loss:
+                            should_exit = True
+                            exit_reason = "STOP_LOSS"
+                        elif target and current_price <= target:
+                            should_exit = True
+                            exit_reason = "TARGET"
+
+                    # Check time-based exit for intraday
+                    if not should_exit and product == "I":
+                        should_exit, time_reason = self._check_time_exit()
+                        if should_exit:
+                            exit_reason = time_reason
+
+                    # Execute exit if needed
+                    if should_exit and exit_reason:
                         try:
-                            square_off_result = self.operator.square_off(
-                                symbol=symbol,
-                                instrument_key=instrument_key,
-                                live=True
+                            # Record the exit in tracker
+                            exit_record = self.tracker.record_exit(
+                                trade_id=trade_id,
+                                exit_price=current_price,
+                                exit_reason=exit_reason
                             )
 
-                            action_result["square_off_result"] = square_off_result
+                            actions_taken.append({
+                                "symbol": symbol,
+                                "trade_id": trade_id,
+                                "exit_price": current_price,
+                                "exit_reason": exit_reason,
+                                "pnl_record": exit_record
+                            })
 
-                            if square_off_result.get("status") == "ok":
-                                logger.info(f"✅ {symbol} squared off successfully")
-
-                                # Record exit in tracker
-                                if self.tracker:
-                                    try:
-                                        pnl_record = self.tracker.record_exit(
-                                            symbol=symbol,
-                                            exit_price=current_price,
-                                            exit_reason=exit_reason,
-                                            order_id=square_off_result.get("order_id"),
-                                        )
-                                        action_result["pnl_record"] = pnl_record
-
-                                        net_pnl = pnl_record.get("net_pnl", 0)
-                                        pnl_pct = pnl_record.get("pnl_percent", 0)
-                                        logger.info(f"💰 P&L: {symbol} → ₹{net_pnl:.2f} ({pnl_pct:+.2f}%)")
-
-                                    except Exception as e:
-                                        logger.error(f"Error recording exit for {symbol}: {e}")
-                            else:
-                                logger.error(f"❌ Failed to square off {symbol}: {square_off_result.get('message')}")
+                            logger.info(f"✅ Exited {symbol}: {exit_reason} at {current_price}")
 
                         except Exception as e:
-                            logger.error(f"Error squaring off {symbol}: {e}")
-                            action_result["error"] = str(e)
+                            logger.error(f"Error recording exit for {symbol}: {e}")
+
+                return {
+                    "open_positions": positions_checked,
+                    "actions_taken": actions_taken,
+                    "positions_checked": positions_checked,
+                    "message": f"checked_{positions_checked}_positions"
+                }
+
+            else:
+                # Live mode: use broker positions
+                if not self.operator:
+                    return {"error": "operator_not_available_for_live_mode"}
+
+                positions_data = self.operator.get_positions(include_closed=False)
+                broker_positions = positions_data.get("positions", [])
+
+                if not broker_positions:
+                    logger.info("No open positions to monitor")
+                    return {
+                        "open_positions": 0,
+                        "actions_taken": [],
+                        "message": "no_open_positions"
+                    }
+
+                # Get tracked positions (with SL/target info)
+                tracked_positions = {}
+                if self.tracker:
+                    for pos in self.tracker.get_open_positions():
+                        symbol = pos.get("symbol")
+                        if symbol:
+                            tracked_positions[symbol] = pos
+
+                actions_taken = []
+                positions_checked = 0
+
+                for broker_pos in broker_positions:
+                    symbol = broker_pos.get("tradingsymbol") or broker_pos.get("symbol")
+                    if not symbol:
+                        continue
+
+                    instrument_key = broker_pos.get("instrument_token") or broker_pos.get("instrument_key")
+                    quantity = int(broker_pos.get("quantity", 0) or 0)
+                    product = broker_pos.get("product", "I").upper()
+
+                    if quantity == 0:
+                        continue
+
+                    positions_checked += 1
+
+                    # Get current price
+                    try:
+                        current_price, _ = self.tech.ltp(instrument_key)
+                        if current_price is None:
+                            logger.warning(f"Could not get LTP for {symbol}")
+                            continue
+                        current_price = float(current_price)
+                    except Exception as e:
+                        logger.error(f"Error getting price for {symbol}: {e}")
+                        continue
+
+                    # Check if we have tracking info for this position
+                    tracked = tracked_positions.get(symbol)
+                    if not tracked:
+                        logger.warning(f"Position {symbol} not found in tracker - cannot check SL/target")
+                        continue
+
+                    # Get SL and target from tracked position
+                    stop_loss = tracked.get("stop_loss")
+                    target = tracked.get("target")
+                    side = tracked.get("side", "BUY").upper()
+                    entry_price = tracked.get("entry_price", 0)
+
+                    # Check for exit conditions
+                    exit_reason = None
+                    should_exit = False
+
+                    # Check stop-loss
+                    if stop_loss:
+                        if side == "BUY" and current_price <= stop_loss:
+                            exit_reason = "STOP_LOSS_HIT"
+                            should_exit = True
+                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} <= {stop_loss:.2f}")
+                        elif side == "SELL" and current_price >= stop_loss:
+                            exit_reason = "STOP_LOSS_HIT"
+                            should_exit = True
+                            logger.info(f"🛑 {symbol} STOP-LOSS HIT: {current_price:.2f} >= {stop_loss:.2f}")
+
+                    # Check target
+                    if not should_exit and target:
+                        if side == "BUY" and current_price >= target:
+                            exit_reason = "TARGET_HIT"
+                            should_exit = True
+                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} >= {target:.2f}")
+                        elif side == "SELL" and current_price <= target:
+                            exit_reason = "TARGET_HIT"
+                            should_exit = True
+                            logger.info(f"🎯 {symbol} TARGET HIT: {current_price:.2f} <= {target:.2f}")
+
+                    # Check time-based exit for intraday (after 3:15 PM)
+                    if not should_exit and product == "I":
+                        now = datetime.now(IST)
+                        square_off_time = now.replace(hour=15, minute=15, second=0, microsecond=0)
+                        if now >= square_off_time:
+                            exit_reason = "INTRADAY_TIME_BASED_EXIT"
+                            should_exit = True
+                            logger.info(f"⏰ {symbol} Intraday time-based exit (after 3:15 PM)")
+
+                    # Execute exit if needed
+                    if should_exit:
+                        action_result = {
+                            "symbol": symbol,
+                            "exit_reason": exit_reason,
+                            "current_price": current_price,
+                            "entry_price": entry_price,
+                            "stop_loss": stop_loss,
+                            "target": target,
+                            "timestamp": datetime.now(IST).isoformat(),
+                        }
+
+                        if live:
+                            # Place square-off order
+                            try:
+                                square_off_result = self.operator.square_off(
+                                    symbol=symbol,
+                                    instrument_key=instrument_key,
+                                    live=True
+                                )
+
+                                action_result["square_off_result"] = square_off_result
+
+                                if square_off_result.get("status") == "ok":
+                                    logger.info(f"✅ {symbol} squared off successfully")
+
+                                    # Record exit in tracker
+                                    if self.tracker:
+                                        try:
+                                            pnl_record = self.tracker.record_exit(
+                                                symbol=symbol,
+                                                exit_price=current_price,
+                                                exit_reason=exit_reason,
+                                                order_id=square_off_result.get("order_id"),
+                                            )
+                                            action_result["pnl_record"] = pnl_record
+
+                                            net_pnl = pnl_record.get("net_pnl", 0)
+                                            pnl_pct = pnl_record.get("pnl_percent", 0)
+                                            logger.info(f"💰 P&L: {symbol} → ₹{net_pnl:.2f} ({pnl_pct:+.2f}%)")
+
+                                        except Exception as e:
+                                            logger.error(f"Error recording exit for {symbol}: {e}")
+                                else:
+                                    logger.error(f"❌ Failed to square off {symbol}: {square_off_result.get('message')}")
+
+                            except Exception as e:
+                                logger.error(f"Error squaring off {symbol}: {e}")
+                                action_result["error"] = str(e)
+                        else:
+                            action_result["action"] = "DRY_RUN (set live=True to execute)"
+
+                        actions_taken.append(action_result)
                     else:
-                        action_result["action"] = "DRY_RUN (set live=True to execute)"
+                        # Position is healthy, calculate unrealized P&L
+                        if side == "BUY":
+                            unrealized_pnl = (current_price - entry_price) * quantity
+                        else:
+                            unrealized_pnl = (entry_price - current_price) * quantity
 
-                    actions_taken.append(action_result)
-                else:
-                    # Position is healthy, calculate unrealized P&L
-                    if side == "BUY":
-                        unrealized_pnl = (current_price - entry_price) * quantity
-                    else:
-                        unrealized_pnl = (entry_price - current_price) * quantity
+                        logger.debug(
+                            f"✓ {symbol}: {current_price:.2f} | "
+                            f"SL: {stop_loss:.2f if stop_loss else 'N/A'} | "
+                            f"Target: {target:.2f if target else 'N/A'} | "
+                            f"Unrealized P&L: ₹{unrealized_pnl:.2f}"
+                        )
 
-                    logger.debug(
-                        f"✓ {symbol}: {current_price:.2f} | "
-                        f"SL: {stop_loss:.2f if stop_loss else 'N/A'} | "
-                        f"Target: {target:.2f if target else 'N/A'} | "
-                        f"Unrealized P&L: ₹{unrealized_pnl:.2f}"
-                    )
-
-            return {
-                "open_positions": positions_checked,
-                "actions_taken": actions_taken,
-                "exits_executed": len([a for a in actions_taken if a.get("square_off_result")]),
-                "timestamp": datetime.now(IST).isoformat(),
-            }
+                return {
+                    "open_positions": positions_checked,
+                    "actions_taken": actions_taken,
+                    "exits_executed": len([a for a in actions_taken if a.get("square_off_result")]),
+                    "timestamp": datetime.now(IST).isoformat(),
+                }
 
         except Exception as e:
             logger.error(f"Error checking positions: {e}")
             return {"error": str(e)}
+
+    def _check_time_exit(self) -> tuple[bool, Optional[str]]:
+        """
+        Check if it's time for intraday square-off (after 3:15 PM IST).
+
+        Returns:
+            (should_exit, exit_reason) tuple
+        """
+        now = datetime.now(IST)
+        square_off_time = now.replace(hour=15, minute=15, second=0, microsecond=0)
+
+        if now >= square_off_time:
+            return True, "INTRADAY_TIME_BASED_EXIT"
+
+        return False, None
 
     def monitor_loop(
         self,
