@@ -408,6 +408,39 @@ def discover_and_validate_symbols(mode, date):
             out.append(h)
         return out
 
+    def _is_valid_symbol(sym: str) -> bool:
+        """Validate symbol format to filter junk."""
+        if not sym or not isinstance(sym, str):
+            return False
+
+        sym = sym.strip().upper()
+
+        # Length check: NSE symbols are typically 1-10 chars
+        if len(sym) < 1 or len(sym) > 10:
+            return False
+
+        # Format check: Should be alphanumeric, usually starts with letter
+        if not sym[0].isalpha():
+            return False
+
+        # Should be mostly letters (at least 50%)
+        letter_count = sum(1 for c in sym if c.isalpha())
+        if letter_count < len(sym) * 0.5:
+            return False
+
+        # Common junk patterns to reject
+        junk_patterns = [
+            lambda s: s.isdigit(),  # All numbers
+            lambda s: any(c in s for c in ['_', '-', '.', ' ']),  # Special chars
+            lambda s: len(s) > 6 and any(c.isdigit() for c in s[-3:]),  # Ends with numbers (likely truncated text)
+        ]
+
+        for pattern in junk_patterns:
+            if pattern(sym):
+                return False
+
+        return True
+
     for item in news_data:
         hints = _hint_strings(item)
         for hint in hints:
@@ -424,9 +457,15 @@ def discover_and_validate_symbols(mode, date):
             if ik in seen_ik:
                 continue
 
-            seen_ik.add(ik)
             sym = row.get("symbol") or hint
             name = row.get("name") or hint
+
+            # Validate symbol format
+            if not _is_valid_symbol(sym):
+                emit_status(f"⚠️ Skipping invalid symbol: {sym}")
+                continue
+
+            seen_ik.add(ik)
 
             validated.append({
                 "symbol": sym,

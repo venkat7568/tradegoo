@@ -26,7 +26,7 @@ from langchain_openai import ChatOpenAI
 # LLM Factory (deterministic)
 # -----------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-5-mini"
+OPENAI_MODEL = "gpt-4o-mini"
 
 
 def get_llm() -> ChatOpenAI:
