@@ -363,6 +363,21 @@ HTML = r"""{% raw %}
                 console.error('Refresh error:', error);
                 addActivity('⚠️ Refresh error: ' + error);
             }
+
+            // Check live trading configuration
+            try {
+                const configResp = await fetch('/config-status');
+                const config = await configResp.json();
+
+                if (!config.live_trading_ready) {
+                    const warnings = config.warnings.filter(w => w !== null);
+                    if (warnings.length > 0) {
+                        console.warn('Live trading not ready:', warnings);
+                    }
+                }
+            } catch (error) {
+                console.error('Config check error:', error);
+            }
         }
 
         async function startTrading() {
@@ -371,6 +386,25 @@ HTML = r"""{% raw %}
             const live = document.getElementById('live-mode').value === 'true';
             const maxSymbols = parseInt(document.getElementById('max-symbols').value) || 20;
             const learningMode = document.getElementById('learning-mode').value === 'true';
+
+            // Check live trading configuration if live mode is selected
+            if (live) {
+                try {
+                    const configResp = await fetch('/config-status');
+                    const config = await configResp.json();
+
+                    if (!config.live_trading_ready) {
+                        const warnings = config.warnings.filter(w => w !== null).join('\\n• ');
+                        const message = '⚠️ LIVE TRADING NOT READY:\\n\\n• ' + warnings + '\\n\\nPlease fix these issues before enabling live trading.';
+                        alert(message);
+                        addActivity('❌ Live trading not configured: ' + warnings);
+                        return;
+                    }
+                } catch (error) {
+                    console.error('Config check error:', error);
+                    addActivity('⚠️ Could not verify live trading configuration');
+                }
+            }
 
             if (live && !confirm('⚠️ WARNING: Live trading will use REAL MONEY! Continue?')) return;
 
@@ -701,6 +735,15 @@ def trading_loop(mode, date, live, max_symbols=20, learning_mode=True):
             return
 
         emit_status("🧠 Initializing AI agents...")
+
+        # Log live trading status
+        if live:
+            emit_status("🔴 LIVE TRADING MODE - Real orders will be placed on Upstox")
+            trade_logger.warning("🔴 LIVE TRADING MODE ENABLED - Real money will be used!")
+        else:
+            emit_status("📝 PAPER TRADING MODE - No real orders will be placed")
+            trade_logger.info("📝 Paper trading mode - simulated orders only")
+
         crew = TradingCrew(mode=mode, today=date, live=live)
 
         def _cb(payload: dict):
@@ -791,6 +834,32 @@ def index():
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "time": datetime.now(IST).isoformat()})
+
+@app.route("/config-status")
+def config_status():
+    """Check if the system is properly configured for live trading."""
+    has_upstox_token = bool(os.environ.get("UPSTOX_ACCESS_TOKEN"))
+    has_openai_key = bool(os.environ.get("OPENAI_API_KEY"))
+    mode = os.environ.get("MODE", "live").lower()
+    strict_live_mode = os.environ.get("STRICT_LIVE_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+    live_trading_ready = has_upstox_token and has_openai_key
+    if strict_live_mode and mode != "live":
+        live_trading_ready = False
+
+    return jsonify({
+        "live_trading_ready": live_trading_ready,
+        "has_upstox_token": has_upstox_token,
+        "has_openai_key": has_openai_key,
+        "mode": mode,
+        "strict_live_mode": strict_live_mode,
+        "warnings": [
+            "UPSTOX_ACCESS_TOKEN not set" if not has_upstox_token else None,
+            "OPENAI_API_KEY not set" if not has_openai_key else None,
+            f"MODE={mode} but strict_live_mode enabled (requires MODE=live)" if (strict_live_mode and mode != "live") else None,
+        ],
+        "timestamp": datetime.now(IST).isoformat()
+    })
 
 @app.route("/status")
 def get_status():

@@ -693,6 +693,20 @@ def place_order_tool(input_str=None, **kw) -> str:
         p.get("target"), p.get("target_pct")
     )
 
+    # IMPORTANT: Log warning if live=False to make paper trading explicit
+    if not p.get("live"):
+        logger.warning(
+            "⚠️  PAPER TRADING MODE: Order for %s will NOT be placed on broker (live=False)",
+            p.get("symbol")
+        )
+        print(f"⚠️  PAPER TRADING: {p.get('symbol')} order will NOT be executed on Upstox (live=False)")
+    else:
+        logger.info(
+            "🔴 LIVE TRADING MODE: Order for %s WILL BE PLACED on broker (live=True)",
+            p.get("symbol")
+        )
+        print(f"🔴 LIVE ORDER: {p.get('symbol')} order WILL BE EXECUTED on Upstox (live=True)")
+
     try:
         res = OP.place_order(**p)
 

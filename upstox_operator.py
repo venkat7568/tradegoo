@@ -609,15 +609,17 @@ class UpstoxOperator:
 
         if not live:
             # Dry-run shows computed SL / target to confirm
+            log.warning("PAPER TRADING: Order for %s will NOT be placed (live=False)", symbol)
             return {
                 "live": False,
                 "dry_run": True,
                 "request": payload,
                 "computed": {"stop_loss": stop_px, "target": tgt_px},
-                "note": "Set live=True to execute",
+                "note": "Set live=True to execute. This is PAPER TRADING mode - no real orders placed.",
             }
 
         # 1) Place entry
+        log.info("🔴 LIVE TRADING: Placing real order for %s on Upstox", symbol)
         st, data = self._post("/v2/order/place", payload)
         if st != 200 or not isinstance(data, dict):
             return {
