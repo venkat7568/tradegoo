@@ -98,7 +98,6 @@ class UpstoxOperator:
         api_base: Optional[str] = None,
         strict_live_mode: Optional[bool] = None,
         mode: Optional[str] = None,
-        allow_insecure_ssl: Optional[bool] = None,
         tz: Optional[str] = None,
         session: Optional["requests.Session"] = None,
         tech: Optional[UpstoxTechnicalClient] = None,
@@ -113,10 +112,7 @@ class UpstoxOperator:
             if strict_live_mode is None else strict_live_mode
         )
         self.mode = (mode or os.environ.get("MODE", "live")).strip().lower()
-        self.allow_insecure_ssl = bool(
-            os.environ.get("ALLOW_INSECURE_SSL", "").lower() == "true"
-            if allow_insecure_ssl is None else allow_insecure_ssl
-        )
+        # SECURITY: SSL/TLS verification is always enabled - no bypass allowed
         self.IST = ZoneInfo(os.environ.get("TZ", tz or "Asia/Kolkata"))
 
         self.sess = session or requests.Session()
@@ -152,7 +148,7 @@ class UpstoxOperator:
                 params=params or {},
                 headers=self._headers(),
                 timeout=timeout,
-                verify=not self.allow_insecure_ssl,
+                verify=True,  # SECURITY: Always verify SSL/TLS certificates
             )
             if r.status_code == 200 and r.content:
                 try:
@@ -161,27 +157,8 @@ class UpstoxOperator:
                     return r.status_code, {}
             return r.status_code, (r.json() if r.content else {})
         except Exception as e:
-            if not self.allow_insecure_ssl:
-                log.warning("GET %s failed: %s", url, e)
-                return 0, {"error": str(e)}
-            # retry insecure
-            try:
-                r = self.sess.get(
-                    url,
-                    params=params or {},
-                    headers=self._headers(),
-                    timeout=timeout,
-                    verify=False,
-                )
-                if r.status_code == 200 and r.content:
-                    try:
-                        return r.status_code, r.json()
-                    except Exception:
-                        return r.status_code, {}
-                return r.status_code, (r.json() if r.content else {})
-            except Exception as e2:
-                log.error("GET %s failed (insecure): %s", url, e2)
-                return 0, {"error": str(e2)}
+            log.warning("GET %s failed: %s", url, e)
+            return 0, {"error": str(e)}
 
     def _post(self, path: str, payload: Dict[str, Any], timeout: int = 30) -> Tuple[int, Any]:
         url = path if path.startswith("http") else f"{self.api_base}{path}"
@@ -192,7 +169,7 @@ class UpstoxOperator:
                 json=payload,
                 headers=self._headers(),
                 timeout=timeout,
-                verify=not self.allow_insecure_ssl,
+                verify=True,  # SECURITY: Always verify SSL/TLS certificates
             )
             if r.status_code == 200 and r.content:
                 try:
@@ -201,27 +178,8 @@ class UpstoxOperator:
                     return r.status_code, {}
             return r.status_code, (r.json() if r.content else {})
         except Exception as e:
-            if not self.allow_insecure_ssl:
-                log.warning("POST %s failed: %s", url, e)
-                return 0, {"error": str(e)}
-            # retry insecure
-            try:
-                r = self.sess.post(
-                    url,
-                    json=payload,
-                    headers=self._headers(),
-                    timeout=timeout,
-                    verify=False,
-                )
-                if r.status_code == 200 and r.content:
-                    try:
-                        return r.status_code, r.json()
-                    except Exception:
-                        return r.status_code, {}
-                return r.status_code, (r.json() if r.content else {})
-            except Exception as e2:
-                log.error("POST %s failed (insecure): %s", url, e2)
-                return 0, {"error": str(e2)}
+            log.warning("POST %s failed: %s", url, e)
+            return 0, {"error": str(e)}
 
     def _delete(self, path: str, timeout: int = 30) -> Tuple[int, Any]:
         url = path if path.startswith("http") else f"{self.api_base}{path}"
@@ -231,7 +189,7 @@ class UpstoxOperator:
                 url,
                 headers=self._headers(),
                 timeout=timeout,
-                verify=not self.allow_insecure_ssl,
+                verify=True,  # SECURITY: Always verify SSL/TLS certificates
             )
             if r.status_code == 200 and r.content:
                 try:
@@ -240,25 +198,8 @@ class UpstoxOperator:
                     return r.status_code, {}
             return r.status_code, (r.json() if r.content else {})
         except Exception as e:
-            if not self.allow_insecure_ssl:
-                log.warning("DELETE %s failed: %s", url, e)
-                return 0, {"error": str(e)}
-            try:
-                r = self.sess.delete(
-                    url,
-                    headers=self._headers(),
-                    timeout=timeout,
-                    verify=False,
-                )
-                if r.status_code == 200 and r.content:
-                    try:
-                        return r.status_code, r.json()
-                    except Exception:
-                        return r.status_code, {}
-                return r.status_code, (r.json() if r.content else {})
-            except Exception as e2:
-                log.error("DELETE %s failed (insecure): %s", url, e2)
-                return 0, {"error": str(e2)}
+            log.warning("DELETE %s failed: %s", url, e)
+            return 0, {"error": str(e)}
 
     # ---------- safety ----------
     def _live_guard(self, live: bool) -> Optional[Dict[str, Any]]:
@@ -668,15 +609,17 @@ class UpstoxOperator:
 
         if not live:
             # Dry-run shows computed SL / target to confirm
+            log.warning("PAPER TRADING: Order for %s will NOT be placed (live=False)", symbol)
             return {
                 "live": False,
                 "dry_run": True,
                 "request": payload,
                 "computed": {"stop_loss": stop_px, "target": tgt_px},
-                "note": "Set live=True to execute",
+                "note": "Set live=True to execute. This is PAPER TRADING mode - no real orders placed.",
             }
 
         # 1) Place entry
+        log.info("🔴 LIVE TRADING: Placing real order for %s on Upstox", symbol)
         st, data = self._post("/v2/order/place", payload)
         if st != 200 or not isinstance(data, dict):
             return {

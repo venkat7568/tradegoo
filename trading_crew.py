@@ -47,6 +47,57 @@ from crew_tools import (
 from upstox_technical import UpstoxTechnicalClient
 from news_client import NewsClient
 
+# ============================================================================
+# JSON Parsing Utilities - Safer JSON extraction from agent responses
+# ============================================================================
+import logging
+logger = logging.getLogger(__name__)
+
+def safe_parse_json(text: str, fallback: Optional[dict] = None, log_failures: bool = True) -> Optional[dict]:
+    """
+    Safely parse JSON from text that may contain surrounding content.
+
+    Args:
+        text: Input text potentially containing JSON
+        fallback: Default value if parsing fails
+        log_failures: Whether to log parsing failures
+
+    Returns:
+        Parsed dict or fallback value
+    """
+    if not text:
+        return fallback
+
+    text = str(text).strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting JSON from text
+    if "{" in text and "}" in text:
+        json_start = text.find("{")
+        json_end = text.rfind("}") + 1
+
+        if json_end > json_start > 0:
+            try:
+                json_str = text[json_start:json_end]
+                result = json.loads(json_str)
+                if log_failures:
+                    logger.debug(f"Extracted JSON from text (length: {len(text)} -> {len(json_str)})")
+                return result
+            except json.JSONDecodeError as e:
+                if log_failures:
+                    logger.warning(f"Failed to parse extracted JSON: {e}")
+                    logger.debug(f"Original text: {text[:200]}...")
+
+    if log_failures:
+        logger.error(f"Failed to parse JSON from text: {text[:200]}...")
+
+    return fallback
+
 # Trade tracker for P&L calculation
 from trade_tracker import TradeTracker
 
@@ -304,8 +355,19 @@ class TradingCrew:
         self._emit_status("market_wait_start", {})
         print("⏳ Waiting for market to open...")
 
+        # SECURITY: Add timeout to prevent infinite waiting
+        max_wait_seconds = 3600  # 1 hour maximum wait
+        start_time = time.time()
+
         try:
             while True:
+                # Check timeout
+                elapsed = time.time() - start_time
+                if elapsed > max_wait_seconds:
+                    print(f"⚠️ Market wait timeout after {max_wait_seconds}s - proceeding anyway")
+                    self._emit_status("market_wait_timeout", {"elapsed_seconds": elapsed})
+                    break
+
                 status = self.operator.market_session_status()
                 is_open = status.get("open", False)
                 phase = status.get("status", "UNKNOWN")
@@ -313,7 +375,7 @@ class TradingCrew:
                 if is_open:
                     print(f"✅ Market is open (phase: {phase})")
                     break
-                print(f"⏳ Market closed (phase: {phase}), waiting...")
+                print(f"⏳ Market closed (phase: {phase}), waiting... ({int(elapsed)}s elapsed)")
                 time.sleep(30)
         except Exception as e:
             print(f"⚠️ Error waiting for market: {e}")
@@ -851,28 +913,26 @@ Return ONLY this JSON (NO arrays, NO nested objects):
         entry_result_str = str(entry_crew.kickoff()).strip()
         self._emit_status("entry_validation_complete", {"symbol": symbol, "result": entry_result_str})
 
-        # Parse entry validation result
-        try:
-            # Extract JSON from text if needed
-            if "{" in entry_result_str:
-                json_start = entry_result_str.find("{")
-                json_end = entry_result_str.rfind("}") + 1
-                if json_end > json_start:
-                    entry_result_str = entry_result_str[json_start:json_end]
+        # Parse entry validation result with improved error handling
+        entry_validation = safe_parse_json(
+            entry_result_str,
+            fallback={
+                "entry_decision": "ENTER_NOW",
+                "entry_quality_score": 65,
+                "reason": "Validator failed, trusting decision agent"
+            }
+        )
 
-            # Try parsing
-            try:
-                entry_validation = json.loads(entry_result_str)
-            except json.JSONDecodeError:
-                # FIXED: Default to SKIP on validator failure - safety first!
-                print(f"⚠️ Entry validation malformed JSON, defaulting to SKIP for safety")
-                entry_validation = {
-                    "entry_decision": "SKIP",
-                    "entry_quality_score": 0,
-                    "reason": "Validator failed - cannot assess entry quality safely"
-                }
+        # Use safer default: SKIP if validation fails instead of ENTER_NOW
+        if entry_validation.get("entry_decision") is None:
+            print(f"⚠️ Entry validation malformed JSON, defaulting to SKIP for safety")
+            entry_validation = {
+                "entry_decision": "SKIP",
+                "entry_quality_score": 0,
+                "reason": "Validator failed - cannot assess entry quality safely"
+            }
 
-            entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
+        entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
             entry_quality = int(entry_validation.get("entry_quality_score") or 0)
             entry_reason = entry_validation.get("reason", "")
 
@@ -1149,17 +1209,10 @@ Return only JSON like:
 
         exec_result = str(exec_crew.kickoff()).strip()
 
-        # Parse execution result to extract trade details
-        exec_data = None
-        try:
-            if "{" in exec_result:
-                json_start = exec_result.find("{")
-                json_end = exec_result.rfind("}") + 1
-                if json_end > json_start:
-                    exec_json_str = exec_result[json_start:json_end]
-                    exec_data = json.loads(exec_json_str)
-        except Exception as e:
-            print(f"⚠️ Could not parse execution result JSON: {e}")
+        # Parse execution result to extract trade details with improved error handling
+        exec_data = safe_parse_json(exec_result, fallback=None, log_failures=True)
+        if exec_data is None:
+            print(f"⚠️ Could not parse execution result for trade tracking")
 
         # FIXED: Record trade entry in tracker using plan data (don't depend on exec_data parsing)
         # This ensures position is tracked even if execution result JSON parsing fails
@@ -1396,10 +1449,7 @@ Return only JSON like:
                         # Check if execution has order details indicating success
                         exec_data = execution.get("execution")
                         if isinstance(exec_data, str):
-                            try:
-                                exec_data = json.loads(exec_data)
-                            except Exception:
-                                pass
+                            exec_data = safe_parse_json(exec_data, fallback=None, log_failures=False)
                         if isinstance(exec_data, dict) and exec_data.get("status") in ("success", "ok"):
                             executed_positions += 1
                             print(f"✅ Position opened: {executed_positions}/{max_positions}")

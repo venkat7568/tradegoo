@@ -481,15 +481,20 @@ class MarketContext:
         return recommendations.get(assessment, "No clear market direction. Trade cautiously.")
 
 
-# Global singleton instance
+# Global singleton instance with thread-safety
+import threading
 _market_context_instance: Optional[MarketContext] = None
+_market_context_lock = threading.Lock()
 
 
 def get_market_context() -> MarketContext:
-    """Get the global market context instance."""
+    """Get the global market context instance (thread-safe)."""
     global _market_context_instance
     if _market_context_instance is None:
-        _market_context_instance = MarketContext()
+        with _market_context_lock:
+            # Double-check locking pattern
+            if _market_context_instance is None:
+                _market_context_instance = MarketContext()
     return _market_context_instance
 
 

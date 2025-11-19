@@ -32,10 +32,35 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # Fixed: valid Ope
 AGENT_VERBOSE = os.environ.get("AGENT_VERBOSE", "true").lower() in ("true", "1", "yes")
 
 
+def mask_api_key(key: str) -> str:
+    """Mask API key for logging (show first/last 4 chars only)."""
+    if not key or len(key) < 8:
+        return "***"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def validate_api_key(key: str) -> bool:
+    """Validate API key format (basic check)."""
+    if not key:
+        return False
+    # OpenAI keys typically start with "sk-" and are longer than 20 chars
+    if not key.startswith("sk-"):
+        return False
+    if len(key) < 20:
+        return False
+    return True
+
+
 def get_llm() -> ChatOpenAI:
     """Return a configured, low-temperature OpenAI chat model."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    # SECURITY: Validate API key format
+    if not validate_api_key(OPENAI_API_KEY):
+        masked_key = mask_api_key(OPENAI_API_KEY)
+        raise RuntimeError(f"OPENAI_API_KEY appears to be invalid (key: {masked_key})")
+
     # ChatOpenAI reads the key from env; passing explicitly for clarity.
     return ChatOpenAI(
         model=OPENAI_MODEL,

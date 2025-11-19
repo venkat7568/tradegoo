@@ -220,14 +220,9 @@ class InstrumentCache:
     def _download(self, url: str) -> None:
         if not _HAS_REQ:
             raise RuntimeError("requests not installed")
-        insecure = (os.environ.get("ALLOW_INSECURE_SSL","").lower() == "true")
+        # SECURITY: Always verify SSL/TLS certificates
         self.log.info("Downloading instruments: %s", url)
-        try:
-            r = requests.get(url, timeout=120, verify=self.verify_tls and not insecure)
-        except Exception as e:
-            if not insecure: raise
-            self.log.warning("TLS verify failed, retrying insecure: %s", e)
-            r = requests.get(url, timeout=120, verify=False)
+        r = requests.get(url, timeout=120, verify=True)
         r.raise_for_status()
         data = r.content
         if url.endswith(".gz"):
@@ -426,26 +421,16 @@ class UpstoxTechnicalClient:
 
     def _get(self, path: str, params: Optional[Dict[str,Any]]=None, timeout:int=30) -> Tuple[int, Any]:
         url = path if path.startswith("http") else (self.api_base + path)
-        insecure = (os.environ.get("ALLOW_INSECURE_SSL","").lower()=="true")
+        # SECURITY: Always verify SSL/TLS certificates
         try:
-            r = self.sess.get(url, headers=self._headers(), params=params, timeout=timeout, verify=self.verify_tls and not insecure)
+            r = self.sess.get(url, headers=self._headers(), params=params, timeout=timeout, verify=True)
             if r.status_code == 200 and r.content:
                 try: return r.status_code, r.json()
                 except Exception: return r.status_code, {}
             return r.status_code, (r.json() if r.content else {})
         except Exception as e:
-            if not insecure:
-                self.log.warning("GET %s failed: %s", url, e)
-                return 0, {"error": str(e)}
-            self.log.warning("Retrying insecure due to ALLOW_INSECURE_SSL=true: %s", e)
-            try:
-                r = self.sess.get(url, headers=self._headers(), params=params, timeout=timeout, verify=False)
-                if r.status_code == 200 and r.content:
-                    try: return r.status_code, r.json()
-                    except Exception: return r.status_code, {}
-                return r.status_code, (r.json() if r.content else {})
-            except Exception as e2:
-                return 0, {"error": str(e2)}
+            self.log.warning("GET %s failed: %s", url, e)
+            return 0, {"error": str(e)}
 
     # resolve
     def resolve(self, query: str) -> Dict[str,Any]:
