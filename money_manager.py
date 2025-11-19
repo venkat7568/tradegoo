@@ -88,8 +88,10 @@ class MoneyManager:
         return {
             # Capital allocation
             "total_capital": 100000.0,  # PLACEHOLDER - Configure your actual capital!
-            "intraday_allocation_pct": 40.0,  # % allocated to intraday
-            "swing_allocation_pct": 60.0,  # % allocated to swing
+            # FIXED: Both intraday and swing can use full capital - no rigid split
+            # Allocation percentages now represent max allowed, not reserved amounts
+            "intraday_allocation_pct": 90.0,  # Max % for intraday (up to 90% of capital)
+            "swing_allocation_pct": 90.0,  # Max % for swing (up to 90% of capital)
 
             # Position limits
             "max_positions": 5,  # Max open positions at once
@@ -98,7 +100,7 @@ class MoneyManager:
 
             # Capital usage limits
             "max_capital_usage_pct": 90.0,  # Max % of capital to use
-            "min_cash_reserve": 10000.0,  # Minimum cash to keep aside
+            "min_cash_reserve": 1000.0,  # Minimum cash to keep aside (lowered for small accounts)
 
             # Risk limits per trade
             "max_risk_per_trade_pct": 1.0,  # Max 1% risk per trade
@@ -307,15 +309,9 @@ class MoneyManager:
                 can_open = False
                 reasons.append(f"risk_too_high (₹{risk_amount:.2f} > ₹{max_risk:.2f} max)")
 
-        # Check product-specific allocation
-        product_type = "intraday" if product.upper() == "I" else "swing"
-        allocated = wallet[f"{product_type}_allocation"]
-
-        # Get current positions (would need position tracker)
-        # For now, use simple allocation check
-        if position_value > allocated:
-            can_open = False
-            reasons.append(f"{product_type}_allocation_exceeded (₹{position_value:.2f} > ₹{allocated:.2f})")
+        # FIXED: Removed rigid product-specific allocation check
+        # Both intraday and swing can now use available capital flexibly
+        # The max_capital_usage_pct (90%) applies to total usage, not per-style
 
         return {
             "can_open": can_open,
