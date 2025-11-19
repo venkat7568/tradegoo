@@ -779,31 +779,11 @@ Return JSON only (include style!):
             return decision
 
         except Exception as e:
-            # FIXED: Try to extract decision from text before giving up
-            print(f"⚠️ Could not parse decision JSON, attempting text extraction...")
-            print(f"   Raw result: {result[:200]}...")
-
-            direction = "SKIP"
-            confidence = None
-
-            # Try to extract direction from text
-            result_upper = result.upper()
-            if "BUY" in result_upper and "SELL" not in result_upper:
-                direction = "BUY"
-                print(f"   Extracted direction: BUY from text")
-            elif "SELL" in result_upper and "BUY" not in result_upper:
-                direction = "SELL"
-                print(f"   Extracted direction: SELL from text")
-
-            # Try to extract confidence (look for numbers between 0 and 1)
-            import re
-            conf_match = re.search(r'confidence["\s:]*([0-9.]+)', result, re.IGNORECASE)
-            if conf_match:
-                try:
-                    confidence = float(conf_match.group(1))
-                    print(f"   Extracted confidence: {confidence}")
-                except:
-                    pass
+            # FIXED: DO NOT attempt to extract or execute trades on parse errors
+            # Executing with unreliable/malformed data is too risky
+            print(f"⚠️ Could not parse decision JSON - defaulting to SKIP for safety")
+            print(f"   Parse error: {e}")
+            print(f"   Raw result (first 300 chars): {result[:300]}...")
 
             self._log_incident(
                 {
@@ -811,15 +791,15 @@ Return JSON only (include style!):
                     "symbol": symbol,
                     "error": str(e),
                     "raw_result": result,
-                    "extracted_direction": direction,
-                    "extracted_confidence": confidence,
+                    "action": "SKIP (safety default)",
                 }
             )
             decision = {
                 "symbol": symbol,
-                "direction": direction,
-                "confidence": confidence,
-                "reason": "parse_error_with_extraction" if direction != "SKIP" else "parse_error",
+                "direction": "SKIP",
+                "confidence": 0.0,
+                "reason": "parse_error_safety_skip",
+                "error": str(e),
                 "raw": result,
                 "timestamp": datetime.now(IST).isoformat(),
             }

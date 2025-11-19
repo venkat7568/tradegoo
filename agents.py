@@ -140,19 +140,20 @@ PROCESS
    - If m30 trend is strong (≥0.70) AND aligned with d1 → prefer INTRADAY
    - If d1 trend is strong but m30 weaker → prefer SWING
    - If both weak → SKIP
+   - PRIORITY RULE: When both intraday and swing meet their gates, ALWAYS choose INTRADAY for faster profits
 
 4) Calculate CONFIDENCE (product-specific):
 
    FOR INTRADAY (short-term, 30m charts):
    - Use m30_strength as dominant technical
    - confidence = 0.70 × m30_strength + 0.30 × news_score
-   - Gate: ≥0.60 (higher bar for quick trades)
+   - Gate: ≥0.55 (lowered to allow more intraday opportunities for max profit)
    - Rationale: Intraday relies heavily on momentum, less on news
 
    FOR SWING (multi-day, daily charts):
    - Use d1_strength as dominant technical
    - confidence = 0.55 × d1_strength + 0.45 × news_score
-   - Gate: ≥0.50 (standard bar)
+   - Gate: ≥0.45 (lowered to allow more swing opportunities)
    - Rationale: Swing benefits from both trend + fundamental news
 
 5) ALIGNMENT RULES:
@@ -165,9 +166,10 @@ PROCESS
 
 GUARDRAILS
 - Do NOT place orders. Only decide direction + style.
-- Confidence bands:
-  • Intraday: High ≥0.70, Medium 0.60-0.69, Low <0.60 → SKIP
-  • Swing: High ≥0.65, Medium 0.50-0.64, Low <0.50 → SKIP
+- Confidence bands (LOWERED for more trading opportunities):
+  • Intraday: High ≥0.65, Medium 0.55-0.64, Low <0.55 → SKIP
+  • Swing: High ≥0.60, Medium 0.45-0.59, Low <0.45 → SKIP
+- When both intraday and swing qualify, ALWAYS choose INTRADAY for faster profit realization
 """
     return Agent(
         role="Trading Lead Coordinator",

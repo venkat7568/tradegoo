@@ -81,16 +81,26 @@ class MarketContext:
             if not nifty_snapshot:
                 return {"error": "nifty_data_not_available"}
 
-            current_price = nifty_snapshot.get("current_price", 0)
+            current_price = nifty_snapshot.get("current_price")
             indicators = nifty_snapshot.get("indicators", {})
 
             # Extract key indicators
-            rsi = indicators.get("rsi14", 50)
-            ema20 = indicators.get("ema20", 0)
-            ema50 = indicators.get("ema50", 0)
-            macd = indicators.get("macd", 0)
-            macd_signal = indicators.get("signal", 0)
-            change_pct = nifty_snapshot.get("change_percent", 0)
+            rsi = indicators.get("rsi14")
+            ema20 = indicators.get("ema20")
+            ema50 = indicators.get("ema50")
+            macd = indicators.get("macd")
+            macd_signal = indicators.get("signal")
+            change_pct = nifty_snapshot.get("change_percent")
+
+            # FIXED: Check for None values before comparisons to prevent TypeError
+            if current_price is None or ema20 is None or ema50 is None:
+                return {"error": "incomplete_nifty_data", "details": "Missing price or EMA data"}
+
+            # Ensure RSI, MACD have defaults if None
+            rsi = rsi if rsi is not None else 50
+            macd = macd if macd is not None else 0
+            macd_signal = macd_signal if macd_signal is not None else 0
+            change_pct = change_pct if change_pct is not None else 0
 
             # Determine trend
             trend = "NEUTRAL"
