@@ -93,9 +93,9 @@ class MoneyManager:
             "intraday_allocation_pct": 90.0,  # Max % for intraday (up to 90% of capital)
             "swing_allocation_pct": 90.0,  # Max % for swing (up to 90% of capital)
 
-            # Position limits
-            "max_positions": 5,  # Max open positions at once
-            "max_intraday_positions": 3,  # Max intraday positions
+            # Position limits (increased for batch execution)
+            "max_positions": 5,  # Max open positions at once (can execute multiple best opportunities)
+            "max_intraday_positions": 5,  # Max intraday positions (with leverage, can handle more)
             "max_swing_positions": 3,  # Max swing positions
 
             # Capital usage limits
