@@ -98,6 +98,55 @@ def safe_parse_json(text: str, fallback: Optional[dict] = None, log_failures: bo
 
     return fallback
 
+
+def validate_technical_data(data: dict, agent_name: str = "unknown") -> bool:
+    """
+    Validate that technical data came from actual tool calls, not LLM fabrication.
+
+    CRITICAL SAFETY CHECK: GPT-5-mini and other incompatible models have been found to
+    fabricate realistic-looking technical data when tool calls fail. This function
+    detects such fabrications to prevent trading on hallucinated analysis.
+
+    Args:
+        data: Technical analysis data to validate
+        agent_name: Name of agent that produced this data (for logging)
+
+    Returns:
+        True if data appears legitimate, False if it looks fabricated
+    """
+    if not isinstance(data, dict):
+        logger.warning(f"[{agent_name}] Technical data is not a dict: {type(data)}")
+        return False
+
+    # RED FLAG 1: Technical data without tool response wrapper
+    # Real tool calls return {"ok": true/false, "symbol": "X", "snapshot": {...}}
+    # Fabricated data often has raw fields like {"ref_price": 156.30, "indicators": {...}}
+    if "ref_price" in data and "ok" not in data:
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'ref_price' but no 'ok' status - likely hallucinated!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # RED FLAG 2: Indicators without proper tool response structure
+    if "indicators" in data and not any(k in data for k in ["ok", "snapshot", "status"]):
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'indicators' but lacks tool response structure!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # RED FLAG 3: Multi-timeframe data without proper nesting
+    # Fabricated data often has: {"tf": {"m30": {"trend": "UP", ...}}}
+    # Real data has: {"ok": true, "symbol": "X", "snapshot": {"tf": {...}}}
+    if "tf" in data and "ok" not in data and "snapshot" not in data:
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'tf' (timeframes) but lacks tool response wrapper!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # Data appears legitimate (has proper tool response structure or is a simple decision)
+    return True
+
+
 # Trade tracker for P&L calculation
 from trade_tracker import TradeTracker
 
@@ -776,6 +825,28 @@ Return JSON only (include style!):
                     result = result[json_start:json_end]
 
             parsed = json.loads(result)
+
+            # CRITICAL SAFETY: Detect fabricated technical data
+            # If LLM fails to call tools, it may fabricate realistic data instead
+            if not validate_technical_data(parsed, agent_name="lead_coordinator"):
+                print(f"🚨 FABRICATED DATA DETECTED! Rejecting decision for safety.")
+                print(f"   This trade would be based on hallucinated technical analysis!")
+                print(f"   Direction: SKIP (forced)")
+                self._log_incident({
+                    "type": "fabricated_data_detected",
+                    "symbol": symbol,
+                    "raw_decision": result[:500],
+                    "timestamp": datetime.now(IST).isoformat(),
+                })
+                return {
+                    "symbol": symbol,
+                    "direction": "SKIP",
+                    "confidence": 0.0,
+                    "raw": result,
+                    "error": "fabricated_data_detected",
+                    "timestamp": datetime.now(IST).isoformat(),
+                }
+
             direction = (parsed.get("direction") or "SKIP").upper()
             conf = parsed.get("confidence", None)
 
