@@ -36,6 +36,7 @@ from crew_tools import (
     calculate_margin_tool,
     calculate_max_quantity_tool,
     place_order_tool,
+    place_intraday_bracket_tool,  # CRITICAL FIX: Was missing - executor couldn't place intraday orders!
     square_off_tool,
     calculate_trade_metrics_tool,
     get_current_time_tool,
@@ -327,6 +328,7 @@ class TradingCrew:
             calculate_margin_tool,
             calculate_max_quantity_tool,
             place_order_tool,
+            place_intraday_bracket_tool,  # CRITICAL FIX: Was missing - executor needs this for intraday trades!
             square_off_tool,
             calculate_trade_metrics_tool,
             get_current_time_tool,
@@ -1229,27 +1231,36 @@ IMPORTANT:
 
         # 4) Executor agent: place order using cleaned plan
         exec_desc = _tmpl(
-            """Execute trade for $symbol using place_order_tool.
+            """Execute trade for $symbol.
 
-IMPORTANT:
-- Use "order_type".
-- Pass "live": $live.
-- product must be "I" or "D".
-- Stop-loss is MANDATORY: provide stop_loss OR stop_loss_pct in the payload.
-- target/target_pct are OPTIONAL.
+CRITICAL INSTRUCTIONS:
+- For INTRADAY trades (product="I" or style="intraday"): Use place_intraday_bracket_tool
+- For SWING trades (product="D" or style="swing"): Use place_order_tool
+- MUST pass "live": $live in the tool call
+- Stop-loss is MANDATORY: provide stop_loss OR stop_loss_pct
+- target/target_pct are OPTIONAL
 
 Input (Position Plan JSON from previous step):
 $plan
 
-DO:
-1) If Mode="$mode" and live=$live, verify market via get_market_status_tool.
-2) Build payload with keys:
-   symbol, side, qty, product, order_type, price,
-   stop_loss, stop_loss_pct, target, target_pct, live, tag.
-3) Call place_order_tool and return its JSON result.
+STEPS:
+1) Check if market is open using get_market_status_tool (only if live=$live)
+2) Extract from plan: symbol, side, qty, product, order_type, entry, stop_loss, target
+3) Call the appropriate tool:
+   - If product="I": place_intraday_bracket_tool with {
+       "symbol": "$symbol",
+       "side": "BUY|SELL",
+       "qty": <from plan>,
+       "product": "I",
+       "order_type": "MARKET",
+       "stop_loss": <from plan>,
+       "target": <from plan>,
+       "live": $live
+     }
+   - If product="D": place_order_tool with same payload
+4) Return the tool's JSON result EXACTLY as-is
 
-Return only JSON like:
-{"status":"ok|error","order":{...},"notes":"..."}
+DO NOT fabricate order IDs or responses. Only return what the tool actually returns.
 """,
             symbol=symbol,
             live=str(self.live).lower(),
