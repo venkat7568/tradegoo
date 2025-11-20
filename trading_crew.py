@@ -1375,95 +1375,145 @@ Return only JSON like:
         max_positions = cycle_results["capital_tracking"]["max_positions"]
         capital_utilization_limit = float(os.environ.get("MAX_CAPITAL_UTILIZATION", "0.90"))
 
-        for symbol in symbols:
+        # PHASE 1: ANALYZE ALL SYMBOLS FIRST (Quality over Quantity)
+        print(f"\n{'='*80}")
+        print(f"📊 PHASE 1: Analyzing ALL {len(symbols)} symbols to find best opportunities...")
+        print(f"{'='*80}\n")
+
+        all_decisions = []
+        for idx, symbol in enumerate(symbols, 1):
             try:
-                # Check position limits BEFORE processing
-                if executed_positions >= max_positions:
-                    print(f"⚠️ Max positions ({max_positions}) reached, skipping remaining symbols")
-                    self._emit_status(
-                        "max_positions_reached",
-                        {"executed": executed_positions, "max": max_positions},
-                    )
-                    break
-
-                # Check capital availability BEFORE processing
-                if self.operator and initial_capital > 0:
-                    try:
-                        current_funds = self.operator.get_funds()
-                        current_available = float(
-                            (current_funds.get("equity") or {}).get("available_margin", 0) or 0
-                        )
-                        used_capital = initial_capital - current_available
-                        utilization = used_capital / initial_capital if initial_capital > 0 else 0
-
-                        print(
-                            f"💰 Capital: ₹{current_available:,.2f} available "
-                            f"(used: ₹{used_capital:,.2f}, {utilization:.1%})"
-                        )
-
-                        if utilization >= capital_utilization_limit:
-                            print(
-                                f"⚠️ Capital utilization {utilization:.1%} >= {capital_utilization_limit:.1%}, "
-                                f"stopping new trades"
-                            )
-                            self._emit_status(
-                                "capital_exhausted",
-                                {
-                                    "utilization": utilization,
-                                    "limit": capital_utilization_limit,
-                                },
-                            )
-                            break
-
-                        if current_available < 1000:  # Minimum ₹1000 required
-                            print(f"⚠️ Insufficient capital (₹{current_available:,.2f} < ₹1,000), stopping")
-                            break
-
-                    except Exception as e:
-                        print(f"⚠️ Error checking capital: {e}")
-
-                print(f"\n{'=' * 80}\n🎯 Processing {symbol} (Position {executed_positions + 1}/{max_positions})\n{'=' * 80}")
+                print(f"🔍 Analyzing {symbol} ({idx}/{len(symbols)})...")
                 decision = self.decide_trade(symbol, market_ctx=market_ctx)
                 cycle_results["decisions"].append(decision)
 
+                # Only keep BUY/SELL decisions for ranking
                 if decision.get("direction") in ("BUY", "SELL"):
-                    confidence = float(
-                        decision.get("confidence")
-                        or self.memory.get("confidence_gate", 0.50)
-                    )
-                    execution = self.size_and_execute(
-                        symbol, decision["direction"], confidence
-                    )
+                    confidence = float(decision.get("confidence") or 0.0)
+                    all_decisions.append({
+                        "symbol": symbol,
+                        "direction": decision["direction"],
+                        "confidence": confidence,
+                        "decision_data": decision,
+                    })
+                    print(f"   ✅ {decision['direction']} signal with {confidence:.3f} confidence")
+                else:
+                    print(f"   ⏭️  SKIP - {decision.get('reason', 'no signal')}")
+
+                time.sleep(0.3)  # Reduced delay for analysis phase
+
+            except Exception as e:
+                print(f"❌ Error analyzing {symbol}: {e}")
+                self._log_incident({
+                    "type": "symbol_analysis_error",
+                    "symbol": symbol,
+                    "error": str(e),
+                })
+                cycle_results["decisions"].append({
+                    "symbol": symbol,
+                    "direction": "ERROR",
+                    "error": str(e),
+                })
+
+        # PHASE 2: RANK AND SELECT BEST OPPORTUNITIES
+        print(f"\n{'='*80}")
+        print(f"🎯 PHASE 2: Ranking opportunities (Quality over Quantity)")
+        print(f"{'='*80}\n")
+
+        if not all_decisions:
+            print("⚠️ No trading opportunities found in any symbols")
+            self._emit_status("no_opportunities", {"analyzed": len(symbols)})
+        else:
+            # Sort by confidence (highest first)
+            all_decisions.sort(key=lambda x: x["confidence"], reverse=True)
+
+            print(f"📋 Found {len(all_decisions)} trading opportunities:")
+            for idx, opp in enumerate(all_decisions, 1):
+                print(f"   {idx}. {opp['symbol']}: {opp['direction']} @ {opp['confidence']:.3f} confidence")
+
+            # Select top N based on available positions
+            max_to_execute = min(max_positions, len(all_decisions))
+            selected = all_decisions[:max_to_execute]
+
+            print(f"\n✨ SELECTED TOP {len(selected)} BEST OPPORTUNITIES:")
+            for opp in selected:
+                print(f"   • {opp['symbol']}: {opp['direction']} @ {opp['confidence']:.3f}")
+
+            # PHASE 3: EXECUTE WITH FRESH PRICES
+            print(f"\n{'='*80}")
+            print(f"🚀 PHASE 3: Executing {len(selected)} trades with CURRENT prices")
+            print(f"{'='*80}\n")
+
+            for opp_idx, opp in enumerate(selected, 1):
+                try:
+                    symbol = opp["symbol"]
+                    direction = opp["direction"]
+                    confidence = opp["confidence"]
+
+                    # Check capital availability BEFORE execution
+                    if self.operator and initial_capital > 0:
+                        try:
+                            current_funds = self.operator.get_funds()
+                            current_available = float(
+                                (current_funds.get("equity") or {}).get("available_margin", 0) or 0
+                            )
+                            used_capital = initial_capital - current_available
+                            utilization = used_capital / initial_capital if initial_capital > 0 else 0
+
+                            print(
+                                f"💰 Capital: ₹{current_available:,.2f} available "
+                                f"(used: ₹{used_capital:,.2f}, {utilization:.1%})"
+                            )
+
+                            if utilization >= capital_utilization_limit:
+                                print(
+                                    f"⚠️ Capital utilization {utilization:.1%} >= {capital_utilization_limit:.1%}, "
+                                    f"stopping remaining trades"
+                                )
+                                self._emit_status(
+                                    "capital_exhausted",
+                                    {"utilization": utilization, "limit": capital_utilization_limit},
+                                )
+                                break
+
+                            if current_available < 1000:
+                                print(f"⚠️ Insufficient capital (₹{current_available:,.2f} < ₹1,000), stopping")
+                                break
+
+                        except Exception as e:
+                            print(f"⚠️ Error checking capital: {e}")
+
+                    print(f"\n{'─'*80}")
+                    print(f"🎯 Executing Trade {opp_idx}/{len(selected)}: {symbol} {direction}")
+                    print(f"{'─'*80}")
+
+                    # Execute with size_and_execute (which gets FRESH prices)
+                    execution = self.size_and_execute(symbol, direction, confidence)
                     cycle_results["executions"].append(execution)
 
                     # Track executed positions
                     if execution.get("status") not in ("skipped", "error"):
-                        # Check if execution has order details indicating success
                         exec_data = execution.get("execution")
                         if isinstance(exec_data, str):
                             exec_data = safe_parse_json(exec_data, fallback=None, log_failures=False)
                         if isinstance(exec_data, dict) and exec_data.get("status") in ("success", "ok"):
                             executed_positions += 1
-                            print(f"✅ Position opened: {executed_positions}/{max_positions}")
+                            print(f"✅ Position {executed_positions} opened successfully")
 
-                time.sleep(0.4)
+                    time.sleep(0.5)  # Brief pause between executions
 
-            except Exception as e:
-                print(f"❌ Error processing {symbol}: {e}")
-                self._log_incident(
-                    {
-                        "type": "symbol_processing_error",
+                except Exception as e:
+                    print(f"❌ Error executing {symbol}: {e}")
+                    self._log_incident({
+                        "type": "symbol_execution_error",
                         "symbol": symbol,
                         "error": str(e),
-                    }
-                )
-                cycle_results["decisions"].append(
-                    {
+                    })
+                    cycle_results["executions"].append({
                         "symbol": symbol,
-                        "direction": "ERROR",
+                        "status": "error",
                         "error": str(e),
-                    }
-                )
+                    })
 
         # Final capital tracking
         if self.operator and initial_capital > 0:
