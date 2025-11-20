@@ -183,8 +183,25 @@ class MoneyManager:
             try:
                 funds = self.operator.get_funds()
                 equity = funds.get("equity", {})
+
+                # CRITICAL FIX: Distinguish between margin and cash
                 available_capital = float(equity.get("available_margin", 0) or 0)
                 used_capital = float(equity.get("used_margin", 0) or 0)
+
+                # Try to get actual cash balance (not margin)
+                # Some brokers provide this as "payin_amount" or "available_balance"
+                actual_cash = float(equity.get("payin_amount", 0) or equity.get("available_balance", 0) or 0)
+
+                if actual_cash > 0 and actual_cash < available_capital:
+                    # We have margin/leverage
+                    leverage_ratio = available_capital / actual_cash if actual_cash > 0 else 1.0
+                    logger.warning(
+                        f"⚠️  LEVERAGE DETECTED: Margin=₹{available_capital:.2f} vs Cash=₹{actual_cash:.2f} (Leverage: {leverage_ratio:.1f}x)"
+                    )
+                    logger.warning(
+                        f"⚠️  Trading with margin increases risk. Losses are amplified!"
+                    )
+
             except Exception as e:
                 logger.error(f"🚨 CRITICAL: Error fetching funds from broker: {e}")
                 logger.error(f"   Cannot trade without real-time capital data!")

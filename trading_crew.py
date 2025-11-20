@@ -198,6 +198,17 @@ class TradingCrew:
             self.operator = UpstoxOperator() if UpstoxOperator else None
             if self.operator:
                 print("✅ Operator initialized")
+                # CRITICAL FIX: Inject this operator instance into crew_tools
+                # so all tools use the operator with correct live mode settings
+                try:
+                    from crew_tools import set_operator_instance
+                    set_operator_instance(self.operator)
+                    if self.live:
+                        print(f"🔴 Live trading enabled - tools will execute REAL orders on Upstox")
+                    else:
+                        print(f"📝 Paper trading mode - tools will simulate orders only")
+                except Exception as inject_err:
+                    print(f"⚠️ Failed to inject operator into tools: {inject_err}")
             else:
                 print("⚠️ Operator not available")
                 # FIXED: Fail fast in live mode if operator not available
