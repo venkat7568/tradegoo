@@ -36,6 +36,7 @@ from crew_tools import (
     calculate_margin_tool,
     calculate_max_quantity_tool,
     place_order_tool,
+    place_intraday_bracket_tool,  # CRITICAL FIX: Was missing - executor couldn't place intraday orders!
     square_off_tool,
     calculate_trade_metrics_tool,
     get_current_time_tool,
@@ -97,6 +98,55 @@ def safe_parse_json(text: str, fallback: Optional[dict] = None, log_failures: bo
         logger.error(f"Failed to parse JSON from text: {text[:200]}...")
 
     return fallback
+
+
+def validate_technical_data(data: dict, agent_name: str = "unknown") -> bool:
+    """
+    Validate that technical data came from actual tool calls, not LLM fabrication.
+
+    CRITICAL SAFETY CHECK: GPT-5-mini and other incompatible models have been found to
+    fabricate realistic-looking technical data when tool calls fail. This function
+    detects such fabrications to prevent trading on hallucinated analysis.
+
+    Args:
+        data: Technical analysis data to validate
+        agent_name: Name of agent that produced this data (for logging)
+
+    Returns:
+        True if data appears legitimate, False if it looks fabricated
+    """
+    if not isinstance(data, dict):
+        logger.warning(f"[{agent_name}] Technical data is not a dict: {type(data)}")
+        return False
+
+    # RED FLAG 1: Technical data without tool response wrapper
+    # Real tool calls return {"ok": true/false, "symbol": "X", "snapshot": {...}}
+    # Fabricated data often has raw fields like {"ref_price": 156.30, "indicators": {...}}
+    if "ref_price" in data and "ok" not in data:
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'ref_price' but no 'ok' status - likely hallucinated!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # RED FLAG 2: Indicators without proper tool response structure
+    if "indicators" in data and not any(k in data for k in ["ok", "snapshot", "status"]):
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'indicators' but lacks tool response structure!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # RED FLAG 3: Multi-timeframe data without proper nesting
+    # Fabricated data often has: {"tf": {"m30": {"trend": "UP", ...}}}
+    # Real data has: {"ok": true, "symbol": "X", "snapshot": {"tf": {...}}}
+    if "tf" in data and "ok" not in data and "snapshot" not in data:
+        logger.error(f"⚠️ FABRICATED DATA DETECTED from {agent_name}!")
+        logger.error(f"   Data contains 'tf' (timeframes) but lacks tool response wrapper!")
+        logger.error(f"   First 200 chars: {str(data)[:200]}")
+        return False
+
+    # Data appears legitimate (has proper tool response structure or is a simple decision)
+    return True
+
 
 # Trade tracker for P&L calculation
 from trade_tracker import TradeTracker
@@ -278,6 +328,7 @@ class TradingCrew:
             calculate_margin_tool,
             calculate_max_quantity_tool,
             place_order_tool,
+            place_intraday_bracket_tool,  # CRITICAL FIX: Was missing - executor needs this for intraday trades!
             square_off_tool,
             calculate_trade_metrics_tool,
             get_current_time_tool,
@@ -776,6 +827,28 @@ Return JSON only (include style!):
                     result = result[json_start:json_end]
 
             parsed = json.loads(result)
+
+            # CRITICAL SAFETY: Detect fabricated technical data
+            # If LLM fails to call tools, it may fabricate realistic data instead
+            if not validate_technical_data(parsed, agent_name="lead_coordinator"):
+                print(f"🚨 FABRICATED DATA DETECTED! Rejecting decision for safety.")
+                print(f"   This trade would be based on hallucinated technical analysis!")
+                print(f"   Direction: SKIP (forced)")
+                self._log_incident({
+                    "type": "fabricated_data_detected",
+                    "symbol": symbol,
+                    "raw_decision": result[:500],
+                    "timestamp": datetime.now(IST).isoformat(),
+                })
+                return {
+                    "symbol": symbol,
+                    "direction": "SKIP",
+                    "confidence": 0.0,
+                    "raw": result,
+                    "error": "fabricated_data_detected",
+                    "timestamp": datetime.now(IST).isoformat(),
+                }
+
             direction = (parsed.get("direction") or "SKIP").upper()
             conf = parsed.get("confidence", None)
 
@@ -1158,27 +1231,36 @@ IMPORTANT:
 
         # 4) Executor agent: place order using cleaned plan
         exec_desc = _tmpl(
-            """Execute trade for $symbol using place_order_tool.
+            """Execute trade for $symbol.
 
-IMPORTANT:
-- Use "order_type".
-- Pass "live": $live.
-- product must be "I" or "D".
-- Stop-loss is MANDATORY: provide stop_loss OR stop_loss_pct in the payload.
-- target/target_pct are OPTIONAL.
+CRITICAL INSTRUCTIONS:
+- For INTRADAY trades (product="I" or style="intraday"): Use place_intraday_bracket_tool
+- For SWING trades (product="D" or style="swing"): Use place_order_tool
+- MUST pass "live": $live in the tool call
+- Stop-loss is MANDATORY: provide stop_loss OR stop_loss_pct
+- target/target_pct are OPTIONAL
 
 Input (Position Plan JSON from previous step):
 $plan
 
-DO:
-1) If Mode="$mode" and live=$live, verify market via get_market_status_tool.
-2) Build payload with keys:
-   symbol, side, qty, product, order_type, price,
-   stop_loss, stop_loss_pct, target, target_pct, live, tag.
-3) Call place_order_tool and return its JSON result.
+STEPS:
+1) Check if market is open using get_market_status_tool (only if live=$live)
+2) Extract from plan: symbol, side, qty, product, order_type, entry, stop_loss, target
+3) Call the appropriate tool:
+   - If product="I": place_intraday_bracket_tool with {
+       "symbol": "$symbol",
+       "side": "BUY|SELL",
+       "qty": <from plan>,
+       "product": "I",
+       "order_type": "MARKET",
+       "stop_loss": <from plan>,
+       "target": <from plan>,
+       "live": $live
+     }
+   - If product="D": place_order_tool with same payload
+4) Return the tool's JSON result EXACTLY as-is
 
-Return only JSON like:
-{"status":"ok|error","order":{...},"notes":"..."}
+DO NOT fabricate order IDs or responses. Only return what the tool actually returns.
 """,
             symbol=symbol,
             live=str(self.live).lower(),

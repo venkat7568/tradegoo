@@ -26,7 +26,23 @@ from langchain_openai import ChatOpenAI
 # LLM Factory (deterministic)
 # -----------------------------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # Fixed: valid OpenAI model
+
+# CRITICAL FIX: Force gpt-4o-mini due to tool calling compatibility issues
+# GPT-5-mini has been found to:
+# 1. Format tool inputs as arrays instead of dictionaries
+# 2. Fabricate technical data when tool calls fail
+# 3. Make trading decisions based on hallucinated analysis
+# This is EXTREMELY DANGEROUS for live trading.
+_env_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+INCOMPATIBLE_MODELS = ["gpt-5-mini", "gpt-3.5-turbo"]
+
+if _env_model in INCOMPATIBLE_MODELS:
+    print(f"\n⚠️  WARNING: Model '{_env_model}' is incompatible with CrewAI tool calling!")
+    print(f"⚠️  Forcing gpt-4o-mini instead to prevent data fabrication.")
+    print(f"⚠️  Please remove OPENAI_MODEL from your environment or set to 'gpt-4o-mini'\n")
+    OPENAI_MODEL = "gpt-4o-mini"
+else:
+    OPENAI_MODEL = _env_model
 
 # Agent verbosity (set via env var, default True for visibility)
 AGENT_VERBOSE = os.environ.get("AGENT_VERBOSE", "true").lower() in ("true", "1", "yes")
