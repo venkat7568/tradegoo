@@ -22,10 +22,12 @@ import math
 import time
 import inspect
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from collections import OrderedDict
 
 from crewai.tools import tool
 
@@ -87,8 +89,6 @@ def set_operator_instance(operator_instance):
         logger.info("✅ Global operator instance updated for tools")
 
 # ---- bounded in-memory caches with LRU eviction ----
-from collections import OrderedDict
-import threading
 
 class BoundedCache:
     """Thread-safe bounded cache with LRU eviction."""
