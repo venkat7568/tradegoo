@@ -893,26 +893,27 @@ Return ONLY this JSON (NO arrays, NO nested objects):
         entry_result_str = str(entry_crew.kickoff()).strip()
         self._emit_status("entry_validation_complete", {"symbol": symbol, "result": entry_result_str})
 
-        # Parse entry validation result with improved error handling
-        entry_validation = safe_parse_json(
-            entry_result_str,
-            fallback={
-                "entry_decision": "ENTER_NOW",
-                "entry_quality_score": 65,
-                "reason": "Validator failed, trusting decision agent"
-            }
-        )
+        try:
+            # Parse entry validation result with improved error handling
+            entry_validation = safe_parse_json(
+                entry_result_str,
+                fallback={
+                    "entry_decision": "ENTER_NOW",
+                    "entry_quality_score": 65,
+                    "reason": "Validator failed, trusting decision agent"
+                }
+            )
 
-        # Use safer default: SKIP if validation fails instead of ENTER_NOW
-        if entry_validation.get("entry_decision") is None:
-            print(f"⚠️ Entry validation malformed JSON, defaulting to SKIP for safety")
-            entry_validation = {
-                "entry_decision": "SKIP",
-                "entry_quality_score": 0,
-                "reason": "Validator failed - cannot assess entry quality safely"
-            }
+            # Use safer default: SKIP if validation fails instead of ENTER_NOW
+            if entry_validation.get("entry_decision") is None:
+                print(f"⚠️ Entry validation malformed JSON, defaulting to SKIP for safety")
+                entry_validation = {
+                    "entry_decision": "SKIP",
+                    "entry_quality_score": 0,
+                    "reason": "Validator failed - cannot assess entry quality safely"
+                }
 
-        entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
+            entry_decision = (entry_validation.get("entry_decision") or "SKIP").upper()
             entry_quality = int(entry_validation.get("entry_quality_score") or 0)
             entry_reason = entry_validation.get("reason", "")
 
