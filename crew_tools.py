@@ -67,6 +67,25 @@ NEWS = NewsClient()
 TECH = UpstoxTechnicalClient()
 OP = UpstoxOperator()
 
+# CRITICAL FIX: Function to inject operator instance from TradingCrew
+# This ensures tools use the operator with correct live/mode settings
+_operator_lock = threading.Lock()
+
+def set_operator_instance(operator_instance):
+    """
+    Replace the global operator instance used by all tools.
+
+    MUST be called by TradingCrew after initialization to ensure
+    the tools use the operator with correct live mode settings.
+
+    Args:
+        operator_instance: UpstoxOperator instance with correct settings
+    """
+    global OP
+    with _operator_lock:
+        OP = operator_instance
+        logger.info("✅ Global operator instance updated for tools")
+
 # ---- bounded in-memory caches with LRU eviction ----
 from collections import OrderedDict
 import threading
