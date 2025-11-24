@@ -400,10 +400,14 @@ def search_news_tool(input_str=None, **kw) -> str:
 @tool("Get Technical Snapshot")
 def get_technical_snapshot_tool(input_str=None, **kw) -> str:
     """
-    Pull a compact technical view for a single NSE cash symbol.
+    Pull a compact technical view for a single NSE cash symbol or instrument key.
 
     Input (dict | JSON | kwargs):
       { "symbol": "HFCL", "days": 7 }
+      OR
+      { "symbol": "NSE_EQ|INE030A01027-EQ", "days": 7 }  # instrument_key
+
+    NOTE: If you have an instrument_key (contains "|"), pass it directly to avoid duplicate lookups!
     """
     try:
         args = _coerce_args(input_str, **kw)
@@ -413,11 +417,13 @@ def get_technical_snapshot_tool(input_str=None, **kw) -> str:
             return _json_fail("missing_symbol")
         days = int(args.get("days", 7) or 7)
 
-        logger.info("get_technical_snapshot_tool called: symbol=%s days=%s", symbol, days)
+        is_instrument_key = "|" in symbol
+        logger.info("get_technical_snapshot_tool called: symbol=%s (is_key=%s) days=%s",
+                   symbol, is_instrument_key, days)
 
         _debounce(f"snap:{symbol}:{days}", 150)
 
-        # short cache (~25s)
+        # short cache (~25s) - use symbol as-is for caching (works for both symbol and instrument_key)
         key = (symbol.upper(), days)
         now = time.time()
         cached = _SNAP_CACHE.get(key)
