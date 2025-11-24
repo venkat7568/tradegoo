@@ -708,23 +708,31 @@ Return JSON only:
         # CRITICAL: Validate instrument key BEFORE doing expensive analysis
         # No instrument key = can't get technical data, can't execute trades
         # So skip immediately to avoid wasting LLM/API calls
+        #
+        # NOTE: tech.resolve() searches the FULL NSE/BSE instrument database dynamically
+        # It can find ANY valid symbol, not just hardcoded ones!
         print(f"🔑 Looking up instrument key for {symbol}...")
         try:
+            # This searches ALL NSE/BSE instruments (fuzzy search, tries hard to find matches)
             resolved = self.operator.tech.resolve(symbol)
             if not resolved or not resolved.get("instrument_key"):
                 print(f"❌ No instrument key found for {symbol} - cannot trade or analyze")
+                print(f"   Searched full NSE/BSE instrument database - symbol not found")
                 decision = {
                     "symbol": symbol,
                     "direction": "SKIP",
                     "reason": "no_instrument_key",
-                    "error": f"Could not resolve instrument key for symbol '{symbol}'. Symbol may not exist on NSE/BSE.",
+                    "error": f"Could not resolve instrument key for symbol '{symbol}'. Symbol may not exist on NSE/BSE or may be delisted.",
                     "timestamp": datetime.now(IST).isoformat(),
                 }
                 self._emit_status("decide_complete", decision)
                 return decision
 
             instrument_key = resolved["instrument_key"]
-            print(f"✅ Found instrument key: {instrument_key}")
+            symbol_name = resolved.get("name", symbol)
+            print(f"✅ Found: {symbol} → {instrument_key}")
+            if symbol_name and symbol_name != symbol:
+                print(f"   Full name: {symbol_name}")
 
         except Exception as e:
             print(f"❌ Error looking up instrument key for {symbol}: {e}")
