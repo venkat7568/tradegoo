@@ -195,6 +195,7 @@ GUARDRAILS
         llm=get_llm(),
         verbose=AGENT_VERBOSE,
         allow_delegation=True,
+        max_iter=8,  # Allow delegation but limit total iterations
     )
 
 
@@ -234,10 +235,15 @@ SCORING
   • 2 days ago:  0.5×
 
 TOOLS
-- Primary:
+- Primary (call ONCE):
   get_recent_news_tool({{"lookback_days":2,"max_items":30,"compact":true}})
-- Targeted:
+- Targeted (call ONCE if needed):
   search_news_tool({{"query":"<SYMBOL> results|downgrade|upgrade","lookback_days":7}})
+
+RETRY POLICY
+- MAX 1 ATTEMPT per tool call
+- If tool fails → work with available data or return partial results
+- DO NOT retry same tool multiple times
 
 OUTPUT
 - Keep news_score in [-1, +1].
@@ -251,6 +257,7 @@ OUTPUT
         llm=get_llm(),
         verbose=AGENT_VERBOSE,
         allow_delegation=False,
+        max_iter=5,  # Allow up to 5 iterations (2 tools + analysis)
     )
 
 
@@ -275,12 +282,21 @@ ROLE
 - Multi-timeframe technical read for intraday (30m) and daily trend.
 
 PROCESS
-1) get_technical_snapshot_tool({{"symbol":"<SYMBOL>","days":7}})
-2) Infer:
+1) Call get_technical_snapshot_tool({{"symbol":"<SYMBOL>","days":7}}) ONCE ONLY
+2) If tool returns {{"ok": false, "error": "missing_symbol"}} or similar error:
+   → STOP immediately. Return: {{"status":"error","reason":"symbol_not_found"}}
+   → DO NOT retry with different symbol variations
+   → DO NOT guess alternative spellings
+3) If tool succeeds, infer:
    - Intraday: VWAP proximity, 30m momentum, RSI/MACD direction
    - Daily: SMA20/50 slope & position, EMA20/50 crossovers
-3) Strength (0..1): alignment vs MAs, RSI distance from 50, MACD hist momentum, clean HL/LH.
-4) vwap_gap = last_close - vwap_today (absolute). If missing, set null.
+4) Strength (0..1): alignment vs MAs, RSI distance from 50, MACD hist momentum, clean HL/LH.
+5) vwap_gap = last_close - vwap_today (absolute). If missing, set null.
+
+RETRY POLICY
+- MAX 1 ATTEMPT per symbol
+- If tool fails → return error status immediately
+- Never fabricate or guess symbol variations
 
 OUTPUT
 - Provide compact signals list and bias.
@@ -293,6 +309,7 @@ OUTPUT
         llm=get_llm(),
         verbose=AGENT_VERBOSE,
         allow_delegation=False,
+        max_iter=3,  # Limit max iterations to prevent infinite loops
     )
 
 

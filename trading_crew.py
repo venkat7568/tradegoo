@@ -24,6 +24,7 @@ from crewai import Crew, Task, Process
 
 # Agents & tools
 from agents import create_all_agents
+from symbol_validator import normalize_symbol, validate_symbol_list
 from crew_tools import (
     get_recent_news_tool,
     search_news_tool,
@@ -674,6 +675,25 @@ Return JSON only:
     # -------------------------------
     def decide_trade(self, symbol: str, market_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self._emit_status("decide_start", {"symbol": symbol})
+
+        # Validate and normalize symbol first
+        is_valid, normalized_symbol, validation_msg = normalize_symbol(symbol)
+        if not is_valid or not normalized_symbol:
+            print(f"❌ Invalid symbol: {symbol} - {validation_msg}")
+            decision = {
+                "symbol": symbol,
+                "direction": "SKIP",
+                "reason": "invalid_symbol",
+                "error": validation_msg,
+                "timestamp": datetime.now(IST).isoformat(),
+            }
+            self._emit_status("decide_complete", decision)
+            return decision
+
+        # Use normalized symbol for all operations
+        if normalized_symbol != symbol:
+            print(f"📝 Symbol normalized: {symbol} → {normalized_symbol}")
+        symbol = normalized_symbol
 
         if symbol in self.memory.get("blacklist", []):
             decision = {
@@ -1349,9 +1369,30 @@ DO NOT fabricate order IDs or responses. Only return what the tool actually retu
     # Full cycle
     # -------------------------------
     def run_decision_cycle(self, symbols: Sequence[str]) -> Dict[str, Any]:
+        # Validate and normalize all symbols upfront
+        print(f"\n🔍 Validating {len(symbols)} symbols...")
+        valid_symbols, validation_errors = validate_symbol_list(list(symbols))
+
+        if validation_errors:
+            print(f"⚠️  Symbol validation warnings:")
+            for err in validation_errors:
+                print(f"   {err}")
+
+        if not valid_symbols:
+            print(f"❌ No valid symbols to analyze!")
+            return {
+                "date": self.today,
+                "mode": self.mode,
+                "error": "no_valid_symbols",
+                "validation_errors": validation_errors,
+                "timestamp": datetime.now(IST).isoformat(),
+            }
+
+        print(f"✅ Proceeding with {len(valid_symbols)} validated symbols: {', '.join(valid_symbols)}")
+
         self._emit_status(
             "cycle_start",
-            {"symbols": list(symbols), "mode": self.mode, "date": self.today},
+            {"symbols": valid_symbols, "mode": self.mode, "date": self.today},
         )
         self._wait_until_open_if_needed()
 
@@ -1417,7 +1458,7 @@ DO NOT fabricate order IDs or responses. Only return what the tool actually retu
             try:
                 print("\n📊 Fetching market context...")
                 # Get complete context with breadth analysis on provided symbols
-                market_ctx = self.market_context.get_complete_market_context(symbols=list(symbols))
+                market_ctx = self.market_context.get_complete_market_context(symbols=valid_symbols)
 
                 nifty = market_ctx.get("nifty", {})
                 breadth = market_ctx.get("breadth", {})
@@ -1459,13 +1500,13 @@ DO NOT fabricate order IDs or responses. Only return what the tool actually retu
 
         # PHASE 1: ANALYZE ALL SYMBOLS FIRST (Quality over Quantity)
         print(f"\n{'='*80}")
-        print(f"📊 PHASE 1: Analyzing ALL {len(symbols)} symbols to find best opportunities...")
+        print(f"📊 PHASE 1: Analyzing ALL {len(valid_symbols)} symbols to find best opportunities...")
         print(f"{'='*80}\n")
 
         all_decisions = []
-        for idx, symbol in enumerate(symbols, 1):
+        for idx, symbol in enumerate(valid_symbols, 1):
             try:
-                print(f"🔍 Analyzing {symbol} ({idx}/{len(symbols)})...")
+                print(f"🔍 Analyzing {symbol} ({idx}/{len(valid_symbols)})...")
                 decision = self.decide_trade(symbol, market_ctx=market_ctx)
                 cycle_results["decisions"].append(decision)
 
@@ -1504,7 +1545,7 @@ DO NOT fabricate order IDs or responses. Only return what the tool actually retu
 
         if not all_decisions:
             print("⚠️ No trading opportunities found in any symbols")
-            self._emit_status("no_opportunities", {"analyzed": len(symbols)})
+            self._emit_status("no_opportunities", {"analyzed": len(valid_symbols)})
         else:
             # Sort by confidence (highest first)
             all_decisions.sort(key=lambda x: x["confidence"], reverse=True)
