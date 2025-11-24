@@ -759,7 +759,31 @@ Breadth Sentiment: {breadth.get('breadth_sentiment', 'NEUTRAL')}
 Agent Guidance: {nifty.get('agent_guidance', 'No guidance available')}"""
 
         decision_desc = _tmpl(
-            """Make a trading decision for $symbol by synthesizing News + Technicals + Market Context.
+            """Make a trading decision for $symbol by SYNTHESIZING the results from specialist agents.
+
+🔴 CRITICAL INSTRUCTIONS - READ CAREFULLY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+YOU HAVE NO TOOLS. You are a COORDINATOR, not a researcher.
+
+The News Sentiment Analyst and Technical Analysis Specialist have ALREADY completed their analysis.
+Their results are in the CONTEXT (previous task outputs).
+
+**DO NOT call any tools yourself.**
+**DO NOT try to fetch news or technical data.**
+**USE ONLY the data provided in the context from the previous agents.**
+
+If the context is missing data or has errors:
+- Work with what's available
+- Return SKIP with reason explaining what's missing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INPUTS (from context):
+1. News Sentiment Analyst output: Contains "news_score" (-1 to +1) and summary
+2. Technical Analysis Specialist output: Contains:
+   - "intraday" with "strength" (0-1) for 30m timeframe (m30_strength)
+   - "daily" with "strength" (0-1) for daily timeframe (d1_strength)
+   - "bias" (bullish/bearish/neutral)
+   - "atr_pct" for volatility
 
 Memory:
 $memory
@@ -767,40 +791,38 @@ $memory
 MARKET CONTEXT (Nifty & Breadth):
 $market_context
 
-IMPORTANT: Consider market context when making decisions:
-- In BEARISH markets (Nifty down, weak breadth): Be more conservative, require higher confidence, prefer defensive stocks
-- In BULLISH markets (Nifty up, strong breadth): Can be more aggressive with good setups
-- In MIXED/NEUTRAL markets: Stock-specific analysis more important, use normal thresholds
+DECISION LOGIC:
 
-CRITICAL: Determine STYLE (intraday vs swing) based on timeframe strengths.
+1. EXTRACT VALUES from context (previous agent outputs):
+   - news_score from News Agent
+   - m30_strength from Technical Agent's intraday.strength
+   - d1_strength from Technical Agent's daily.strength
+   - technical bias from Technical Agent
 
-STYLE SELECTION:
-- If m30_strength ≥ 0.70 AND aligned with d1 → style="intraday"
-- If d1_strength strong but m30 weaker → style="swing"
-- If both weak → SKIP
+2. DETERMINE STYLE (intraday vs swing):
+   - If m30_strength ≥ 0.70 AND aligned with d1 → style="intraday"
+   - If d1_strength strong but m30 weaker → style="swing"
+   - If both weak → SKIP
 
-CONFIDENCE CALCULATION (product-specific):
+3. CALCULATE CONFIDENCE:
+   FOR INTRADAY:
+   - Base confidence = 0.70 × m30_strength + 0.30 × news_score
+   - Adjust for market: +0.05 if market bullish, -0.05 if bearish
+   - Gate: ≥0.60
 
-FOR INTRADAY:
-- Base confidence = 0.70 × m30_strength + 0.30 × news_score
-- Adjust for market: +0.05 if market bullish, -0.05 if bearish
-- Gate: ≥0.60 (higher bar)
+   FOR SWING:
+   - Base confidence = 0.55 × d1_strength + 0.45 × news_score
+   - Adjust for market: +0.05 if market bullish, -0.05 if bearish
+   - Gate: ≥0.50
 
-FOR SWING:
-- Base confidence = 0.55 × d1_strength + 0.45 × news_score
-- Adjust for market: +0.05 if market bullish, -0.05 if bearish
-- Gate: ≥0.50
+4. CHECK ALIGNMENT:
+   - Both align (news + tech same direction) → proceed
+   - Conflict → require dominance (news_score ≥ ±0.70 OR tech_strength ≥ 0.75)
+   - Otherwise → SKIP
 
-ALIGNMENT:
-1) Both align (news + tech same direction) → use that direction
-2) Conflict → require dominance:
-   - news_score ≥ ±0.70 OR
-   - tech_strength ≥ 0.75
-3) Otherwise → SKIP
-
-MARKET OVERRIDE:
-- If market is STRONG_BEARISH and stock signal is BUY: increase confidence requirement to 0.70
-- If market is STRONG_BULLISH and stock signal is BUY: can lower requirement to 0.55 (intraday) / 0.45 (swing)
+5. MARKET OVERRIDE:
+   - STRONG_BEARISH market + BUY signal: require confidence ≥ 0.70
+   - STRONG_BULLISH market + BUY signal: can lower to 0.55 (intraday) / 0.45 (swing)
 
 Return JSON only (include style!):
 {"direction":"BUY|SELL|SKIP","confidence":0..1,"style":"intraday|swing","rationale":"..."}
