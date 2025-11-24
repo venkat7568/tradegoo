@@ -695,7 +695,10 @@ Return JSON only:
             print(f"📝 Symbol normalized: {symbol} → {normalized_symbol}")
         symbol = normalized_symbol
 
+        # CRITICAL: Check blacklist FIRST before any expensive operations
+        # This avoids wasting instrument key lookups on blacklisted symbols
         if symbol in self.memory.get("blacklist", []):
+            print(f"⛔ Symbol {symbol} is blacklisted - skipping")
             decision = {
                 "symbol": symbol,
                 "direction": "SKIP",
@@ -762,16 +765,26 @@ Return JSON only: {"news_score": <float>, "summary": "..."}
 
         tech_desc = _tmpl(
             """Analyze technicals for $symbol (Mode $mode, Date $today).
+
+INSTRUMENT KEY: $instrument_key
+Use this instrument key directly when calling get_technical_snapshot_tool to avoid duplicate lookups.
+
 Use 30m (short-term) and Daily (trend). Extract RSI, EMA20/EMA50, MACD-hist, VWAP gap, ATR%.
 
 Return JSON only:
 {
   "ref_price": <float>,
   "indicators": {"rsi14":..,"ema20":..,"ema50":..,"atr_pct":..,"vwap_gap_pct":..},
-  "tf": {"m30":{"trend":"UP|DOWN|FLAT","strength":0..1}, "d1":{"trend":"UP|DOWN|FLAT","strength":0..1}}
+  "intraday": {"trend":"UP|DOWN|FLAT","strength":0..1},
+  "daily": {"trend":"UP|DOWN|FLAT","strength":0..1},
+  "bias": "bullish|bearish|neutral"
 }
+
+CRITICAL: Use "intraday" and "daily" as keys, NOT "tf.m30" or "tf.d1"!
+The Lead Coordinator will extract intraday.strength and daily.strength directly.
 """,
             symbol=symbol,
+            instrument_key=instrument_key,
             mode=self.mode,
             today=self.today,
         )
