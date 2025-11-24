@@ -64,6 +64,60 @@ if not logger.handlers:
 logger.setLevel(os.environ.get("CREW_TOOLS_LOG_LEVEL", "INFO").upper())
 logger.info("crew_tools initialized, log file: %s", LOG_DIR / "crew_tools.log")
 
+
+# ---- Centralized Configuration Management ----
+class Config:
+    """
+    Centralized configuration from environment variables.
+    Provides type-safe access with defaults.
+    """
+    # Rate limiting
+    API_RATE_LIMIT_PER_SEC = int(os.environ.get("API_RATE_LIMIT_PER_SEC", "10"))
+    API_RATE_LIMIT_PER_MIN = int(os.environ.get("API_RATE_LIMIT_PER_MIN", "100"))
+
+    # Risk management
+    MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
+    MAX_ORDER_VALUE = float(os.environ.get("MAX_ORDER_VALUE", "1000000"))  # ₹10 lakh
+    MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # ₹1 lakh
+
+    # Caching
+    NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))  # 5 minutes
+    TECHNICAL_CACHE_TTL = int(os.environ.get("TECHNICAL_CACHE_TTL", "25"))  # 25 seconds
+
+    # Input validation
+    MAX_NEWS_QUERY_LENGTH = int(os.environ.get("MAX_NEWS_QUERY_LENGTH", "200"))
+    MAX_SYMBOL_LENGTH = int(os.environ.get("MAX_SYMBOL_LENGTH", "50"))
+    MAX_DAYS_LOOKBACK = int(os.environ.get("MAX_DAYS_LOOKBACK", "365"))
+
+    # Circuit breaker
+    CB_FAILURE_THRESHOLD = int(os.environ.get("CB_FAILURE_THRESHOLD", "5"))
+    CB_TIMEOUT = int(os.environ.get("CB_TIMEOUT", "60"))  # seconds
+    CB_BROKER_FAILURE_THRESHOLD = int(os.environ.get("CB_BROKER_FAILURE_THRESHOLD", "3"))
+    CB_BROKER_TIMEOUT = int(os.environ.get("CB_BROKER_TIMEOUT", "120"))
+
+    # Leverage defaults
+    INTRADAY_LEVERAGE = float(os.environ.get("INTRADAY_LEVERAGE", "3.0"))
+    DELIVERY_LEVERAGE = float(os.environ.get("DELIVERY_LEVERAGE", "1.0"))
+
+    # Tick size
+    TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.05"))
+
+    @classmethod
+    def summary(cls) -> str:
+        """Return a formatted summary of all configuration values."""
+        return f"""
+Configuration Summary:
+  Rate Limits: {cls.API_RATE_LIMIT_PER_SEC} calls/sec, {cls.API_RATE_LIMIT_PER_MIN} calls/min
+  Risk Limits: Max {cls.MAX_QTY_PER_ORDER} qty, ₹{cls.MAX_ORDER_VALUE:.0f} value
+  Cache TTL: News {cls.NEWS_CACHE_TTL}s, Technical {cls.TECHNICAL_CACHE_TTL}s
+  Circuit Breaker: {cls.CB_FAILURE_THRESHOLD} failures, {cls.CB_TIMEOUT}s timeout
+  Leverage: Intraday {cls.INTRADAY_LEVERAGE}x, Delivery {cls.DELIVERY_LEVERAGE}x
+"""
+
+# Log configuration on startup
+logger.info("Configuration loaded: %s", Config.summary().strip())
+
+
 # ---- singletons ----
 NEWS = NewsClient()
 TECH = UpstoxTechnicalClient()
@@ -205,12 +259,10 @@ class SystemRateLimiter:
                 "max_per_minute": self.max_per_minute
             }
 
-# Initialize system-wide rate limiter (configurable via env vars)
-_SYSTEM_RATE_LIMIT_PER_SEC = int(os.environ.get("API_RATE_LIMIT_PER_SEC", "10"))
-_SYSTEM_RATE_LIMIT_PER_MIN = int(os.environ.get("API_RATE_LIMIT_PER_MIN", "100"))
+# Initialize system-wide rate limiter (using centralized config)
 _SYSTEM_RATE_LIMITER = SystemRateLimiter(
-    max_calls_per_second=_SYSTEM_RATE_LIMIT_PER_SEC,
-    max_calls_per_minute=_SYSTEM_RATE_LIMIT_PER_MIN
+    max_calls_per_second=Config.API_RATE_LIMIT_PER_SEC,
+    max_calls_per_minute=Config.API_RATE_LIMIT_PER_MIN
 )
 
 
@@ -303,10 +355,22 @@ class CircuitBreaker:
             self.state = "CLOSED"
             self.last_failure_time = None
 
-# Initialize circuit breakers for different services
-_CB_TECHNICAL = CircuitBreaker(failure_threshold=5, timeout=60, name="Technical API")
-_CB_NEWS = CircuitBreaker(failure_threshold=5, timeout=60, name="News API")
-_CB_BROKER = CircuitBreaker(failure_threshold=3, timeout=120, name="Broker API")
+# Initialize circuit breakers for different services (using centralized config)
+_CB_TECHNICAL = CircuitBreaker(
+    failure_threshold=Config.CB_FAILURE_THRESHOLD,
+    timeout=Config.CB_TIMEOUT,
+    name="Technical API"
+)
+_CB_NEWS = CircuitBreaker(
+    failure_threshold=Config.CB_FAILURE_THRESHOLD,
+    timeout=Config.CB_TIMEOUT,
+    name="News API"
+)
+_CB_BROKER = CircuitBreaker(
+    failure_threshold=Config.CB_BROKER_FAILURE_THRESHOLD,
+    timeout=Config.CB_BROKER_TIMEOUT,
+    name="Broker API"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -413,21 +477,93 @@ def _extract_available_margin(funds: dict) -> float:
     return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Enhanced error handling and retry utilities
+# ---------------------------------------------------------------------------
+
+class ErrorType:
+    """Error type classification for smart retry logic."""
+    NETWORK = "network"           # Retriable - connection issues
+    RATE_LIMIT = "rate_limit"     # Retriable with backoff
+    AUTHENTICATION = "auth"        # Not retriable - fix credentials
+    VALIDATION = "validation"      # Not retriable - fix input
+    SERVER_ERROR = "server"        # Retriable - temporary server issue
+    UNKNOWN = "unknown"            # Retriable with caution
+
+def classify_error(e: Exception) -> str:
+    """
+    Classify exception into error types for smart retry logic.
+
+    Returns:
+        ErrorType constant
+    """
+    error_str = str(e).lower()
+    error_type_name = type(e).__name__.lower()
+
+    # Network errors - retriable
+    if any(x in error_type_name for x in ['connection', 'timeout', 'socket']):
+        return ErrorType.NETWORK
+    if any(x in error_str for x in ['connection', 'timeout', 'network', 'unreachable']):
+        return ErrorType.NETWORK
+
+    # Rate limit errors - retriable with backoff
+    if any(x in error_str for x in ['rate limit', 'too many requests', '429']):
+        return ErrorType.RATE_LIMIT
+
+    # Authentication errors - NOT retriable
+    if any(x in error_str for x in ['unauthorized', '401', '403', 'forbidden', 'api key', 'invalid token']):
+        return ErrorType.AUTHENTICATION
+
+    # Validation errors - NOT retriable
+    if any(x in error_str for x in ['invalid', 'validation', 'bad request', '400', 'missing required']):
+        return ErrorType.VALIDATION
+
+    # Server errors - retriable
+    if any(x in error_str for x in ['500', '502', '503', '504', 'internal server', 'bad gateway', 'service unavailable']):
+        return ErrorType.SERVER_ERROR
+
+    return ErrorType.UNKNOWN
+
 def _retry(plan_ms, fn):
     """
+    Enhanced retry with error type classification and exponential backoff with jitter.
+
     plan_ms: iterable of sleep milliseconds (0 for immediate)
     fn:      callable with no args
     returns (ok, value_or_errstr)
     """
     last_err = None
-    for ms in plan_ms:
+    last_err_type = None
+
+    for attempt, ms in enumerate(plan_ms, 1):
         try:
             return True, fn()
         except Exception as e:
+            # Classify error type
+            err_type = classify_error(e)
             last_err = f"{type(e).__name__}: {e}"
-            logger.warning("retry step failed (%sms): %s", ms, last_err)
+            last_err_type = err_type
+
+            # Check if error is retriable
+            if err_type in (ErrorType.AUTHENTICATION, ErrorType.VALIDATION):
+                logger.error(f"Non-retriable error ({err_type}): {last_err}")
+                return False, last_err
+
+            # Log with error type context
+            logger.warning(
+                f"Retry attempt {attempt}/{len(plan_ms)} failed ({err_type}): {last_err}"
+            )
+
+            # Apply sleep with jitter for exponential backoff
             if ms:
-                time.sleep(ms / 1000.0)
+                # Add 10% jitter to prevent thundering herd
+                import random
+                jitter = random.uniform(0.9, 1.1)
+                actual_sleep = (ms / 1000.0) * jitter
+                time.sleep(actual_sleep)
+
+    # All retries exhausted
+    logger.error(f"All retries exhausted. Last error type: {last_err_type}, error: {last_err}")
     return False, last_err
 
 
@@ -438,6 +574,91 @@ def _debounce(key: str, min_ms: int = 150) -> None:
     if now - last < min_ms:
         time.sleep((min_ms - (now - last)) / 1000.0)
     _LAST_CALL_TS[key] = int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Input validation utilities
+# ---------------------------------------------------------------------------
+
+def validate_symbol(symbol: str) -> tuple[bool, str]:
+    """
+    Validate trading symbol format.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not symbol or not isinstance(symbol, str):
+        return False, "Symbol must be a non-empty string"
+
+    symbol = symbol.strip()
+    if len(symbol) == 0:
+        return False, "Symbol cannot be empty"
+
+    if len(symbol) > 50:
+        return False, f"Symbol too long ({len(symbol)} chars, max 50)"
+
+    # Allow alphanumeric, hyphens, underscores, pipes (for instrument keys)
+    import re
+    if not re.match(r'^[A-Za-z0-9_\-|]+$', symbol):
+        return False, "Symbol contains invalid characters"
+
+    return True, ""
+
+def validate_positive_number(value, name: str, min_val=0, max_val=None) -> tuple[bool, str]:
+    """
+    Validate that a value is a positive number within bounds.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return False, f"{name} must be a valid number"
+
+    if num <= min_val:
+        return False, f"{name} must be greater than {min_val}"
+
+    if max_val is not None and num > max_val:
+        return False, f"{name} must be less than or equal to {max_val}"
+
+    return True, ""
+
+def validate_integer(value, name: str, min_val=None, max_val=None) -> tuple[bool, str]:
+    """
+    Validate that a value is an integer within bounds.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return False, f"{name} must be a valid integer"
+
+    if min_val is not None and num < min_val:
+        return False, f"{name} must be at least {min_val}"
+
+    if max_val is not None and num > max_val:
+        return False, f"{name} must be at most {max_val}"
+
+    return True, ""
+
+def validate_side(side: str) -> tuple[bool, str]:
+    """
+    Validate order side (BUY/SELL).
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not side or not isinstance(side, str):
+        return False, "Side must be specified"
+
+    side = side.strip().upper()
+    if side not in ("BUY", "SELL"):
+        return False, f"Side must be BUY or SELL, got '{side}'"
+
+    return True, ""
 
 
 def _round_to_tick(px: float, tick: float) -> float:
@@ -621,10 +842,24 @@ def get_technical_snapshot_tool(input_str=None, **kw) -> str:
     try:
         args = _coerce_args(input_str, **kw)
         symbol = (args.get("symbol") or args.get("query") or "").strip()
-        if not symbol:
-            logger.warning("get_technical_snapshot_tool: missing symbol")
-            return _json_fail("missing_symbol")
-        days = int(args.get("days", 7) or 7)
+
+        # ENHANCED: Validate symbol format
+        is_valid, error_msg = validate_symbol(symbol)
+        if not is_valid:
+            logger.warning(f"get_technical_snapshot_tool: {error_msg}")
+            return _json_fail("invalid_symbol", detail=error_msg)
+
+        # Validate days parameter
+        try:
+            days = int(args.get("days", 7) or 7)
+        except (TypeError, ValueError):
+            logger.warning("get_technical_snapshot_tool: invalid days parameter")
+            return _json_fail("invalid_days", detail="days must be a valid integer")
+
+        is_valid, error_msg = validate_integer(days, "days", min_val=1, max_val=365)
+        if not is_valid:
+            logger.warning(f"get_technical_snapshot_tool: {error_msg}")
+            return _json_fail("invalid_days", detail=error_msg)
 
         is_instrument_key = "|" in symbol
         logger.info("get_technical_snapshot_tool called: symbol=%s (is_key=%s) days=%s",

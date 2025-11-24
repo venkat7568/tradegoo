@@ -215,8 +215,58 @@ if env_warnings:
         print(f"  • {warning}")
     print("="*70 + "\n")
 
-# Max number of different symbols we’ll trade per cycle (NOT a restriction by name)
+# Max number of different symbols we'll trade per cycle (NOT a restriction by name)
 MAX_DISCOVERED_SYMBOLS = int(os.environ.get("MAX_DISCOVERED_SYMBOLS", "20"))
+
+
+# ============================================================================
+# GRACEFUL SHUTDOWN HANDLING
+# ============================================================================
+import signal
+import atexit
+
+_shutdown_handlers = []
+
+def register_shutdown_handler(handler):
+    """Register a function to be called on shutdown."""
+    _shutdown_handlers.append(handler)
+
+def graceful_shutdown(signum=None, frame=None):
+    """Handle graceful shutdown of the application."""
+    print("\n" + "="*70)
+    print("🛑 Graceful shutdown initiated...")
+    print("="*70)
+
+    # Call all registered shutdown handlers
+    for handler in _shutdown_handlers:
+        try:
+            handler()
+        except Exception as e:
+            print(f"⚠️  Error during shutdown handler: {e}")
+
+    # Flush logs
+    try:
+        logging.shutdown()
+        print("✅ Logs flushed")
+    except Exception as e:
+        print(f"⚠️  Error flushing logs: {e}")
+
+    print("="*70)
+    print("👋 Shutdown complete")
+    print("="*70)
+
+    if signum is not None:
+        sys.exit(0)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGINT, graceful_shutdown)   # Ctrl+C
+signal.signal(signal.SIGTERM, graceful_shutdown)  # kill command
+
+# Register atexit handler as fallback
+atexit.register(lambda: graceful_shutdown())
+
+trade_logger.info("✅ Graceful shutdown handlers registered")
+
 
 app = Flask(__name__)
 # SECURITY: Flask SECRET_KEY must be set in environment - no hardcoded default
