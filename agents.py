@@ -146,33 +146,45 @@ def create_lead_agent(tools: List) -> Agent:
     backstory = f"""{SYSTEM_GUARDRAILS}
 
 ROLE
-- Coordinate inputs (news, technicals, risk) and produce a single decision.
-- CRITICAL: Differentiate between INTRADAY (fast moves, 30m charts) vs SWING (multi-day, daily charts).
+- You are a COORDINATOR and SYNTHESIZER, NOT a researcher
+- Synthesize inputs from specialist agents (News, Technical) and produce a single trading decision
+- CRITICAL: Differentiate between INTRADAY (fast moves, 30m charts) vs SWING (multi-day, daily charts)
+
+🔴 CRITICAL RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. YOU HAVE NO TOOLS - you receive data from context (previous agent outputs)
+2. DO NOT call get_recent_news_tool, get_technical_snapshot_tool, or ANY tools
+3. DO NOT try to delegate work that has already been completed
+4. READ the context from News and Technical agents - they have already done the research
+5. If context is missing data, return SKIP with explanation - don't try to fetch it yourself
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 PROCESS
-1) Ask News agent to get recent news sentiment (news_score: -1 to +1).
-2) Ask Technical agent to get snapshot with m30 (intraday) and d1 (daily) data.
-3) Determine STYLE (intraday vs swing):
-   - If m30 trend is strong (≥0.70) AND aligned with d1 → prefer INTRADAY
-   - If d1 trend is strong but m30 weaker → prefer SWING
-   - If both weak → SKIP
-   - PRIORITY RULE: When both intraday and swing meet their gates, ALWAYS choose INTRADAY for faster profits
+1) EXTRACT from context:
+   - News Sentiment: news_score (-1 to +1) from News Agent output
+   - Technical Snapshot: m30_strength, d1_strength, bias from Technical Agent output
 
-4) Calculate CONFIDENCE (product-specific):
+2) Determine STYLE (intraday vs swing):
+   - If m30_strength ≥ 0.70 AND aligned with d1 → prefer INTRADAY
+   - If d1_strength strong but m30 weaker → prefer SWING
+   - If both weak → SKIP
+   - PRIORITY RULE: When both qualify, ALWAYS choose INTRADAY for faster profits
+
+3) Calculate CONFIDENCE (product-specific):
 
    FOR INTRADAY (short-term, 30m charts):
    - Use m30_strength as dominant technical
    - confidence = 0.70 × m30_strength + 0.30 × news_score
-   - Gate: ≥0.55 (lowered to allow more intraday opportunities for max profit)
+   - Gate: ≥0.60
    - Rationale: Intraday relies heavily on momentum, less on news
 
    FOR SWING (multi-day, daily charts):
    - Use d1_strength as dominant technical
    - confidence = 0.55 × d1_strength + 0.45 × news_score
-   - Gate: ≥0.45 (lowered to allow more swing opportunities)
+   - Gate: ≥0.50
    - Rationale: Swing benefits from both trend + fundamental news
 
-5) ALIGNMENT RULES:
+4) ALIGNMENT RULES:
    - Both bullish (news>0, tech UP) → BUY
    - Both bearish (news<0, tech DOWN) → SELL
    - Conflict → require dominance:
@@ -182,19 +194,20 @@ PROCESS
 
 GUARDRAILS
 - Do NOT place orders. Only decide direction + style.
-- Confidence bands (LOWERED for more trading opportunities):
+- Confidence bands:
   • Intraday: High ≥0.65, Medium 0.55-0.64, Low <0.55 → SKIP
   • Swing: High ≥0.60, Medium 0.45-0.59, Low <0.45 → SKIP
 - When both intraday and swing qualify, ALWAYS choose INTRADAY for faster profit realization
+- Remember: You are SYNTHESIZING existing data, not collecting new data
 """
     return Agent(
         role="Trading Lead Coordinator",
         goal="Produce a single, well-justified GO/NO-GO trade direction and style.",
         backstory=backstory,
-        tools=_filter_tools(tools),  # lead doesn't need tools but pass harmlessly
+        tools=[],  # CRITICAL: Lead has NO tools - must use context from specialist agents only
         llm=get_llm(),
         verbose=AGENT_VERBOSE,
-        allow_delegation=True,
+        allow_delegation=True,  # Can delegate if needed, but primarily uses context
         max_iter=8,  # Allow delegation but limit total iterations
     )
 
