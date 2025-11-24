@@ -214,6 +214,101 @@ _SYSTEM_RATE_LIMITER = SystemRateLimiter(
 )
 
 
+# ---- Circuit Breaker for API failure handling ----
+class CircuitBreaker:
+    """
+    Circuit breaker pattern to prevent repeated calls to failing services.
+
+    States:
+    - CLOSED: Normal operation, calls go through
+    - OPEN: Service failing, calls blocked immediately
+    - HALF_OPEN: Testing if service recovered
+    """
+    def __init__(self, failure_threshold=5, timeout=60, name="API"):
+        self.failure_threshold = failure_threshold  # Failures before opening
+        self.timeout = timeout  # Seconds before trying again
+        self.name = name
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.lock = threading.Lock()
+        logger.info(f"🔌 Circuit breaker '{name}' initialized: threshold={failure_threshold}, timeout={timeout}s")
+
+    def call(self, func, *args, **kwargs):
+        """
+        Execute function through circuit breaker.
+
+        Returns:
+            (success: bool, result: Any)
+        """
+        with self.lock:
+            # Check if circuit is OPEN
+            if self.state == "OPEN":
+                # Check if timeout has passed
+                if time.time() - self.last_failure_time >= self.timeout:
+                    logger.info(f"🔌 Circuit breaker '{self.name}': Entering HALF_OPEN state (testing recovery)")
+                    self.state = "HALF_OPEN"
+                else:
+                    # Still in timeout period
+                    logger.warning(f"⚡ Circuit breaker '{self.name}' is OPEN - call blocked")
+                    return False, {"error": "circuit_open", "message": f"{self.name} circuit breaker is OPEN"}
+
+        # Try the call (outside lock to avoid blocking other callers)
+        try:
+            result = func(*args, **kwargs)
+
+            # Success - reset failure count
+            with self.lock:
+                if self.state == "HALF_OPEN":
+                    logger.info(f"🔌 Circuit breaker '{self.name}': Service recovered, closing circuit")
+                self.failure_count = 0
+                self.state = "CLOSED"
+
+            return True, result
+
+        except Exception as e:
+            # Failure - increment count
+            with self.lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+
+                if self.failure_count >= self.failure_threshold:
+                    if self.state != "OPEN":
+                        logger.error(
+                            f"⚡ Circuit breaker '{self.name}' OPENED after {self.failure_count} failures. "
+                            f"Blocking calls for {self.timeout}s"
+                        )
+                    self.state = "OPEN"
+                else:
+                    logger.warning(
+                        f"⚠️  Circuit breaker '{self.name}': Failure {self.failure_count}/{self.failure_threshold}"
+                    )
+
+            return False, {"error": "api_failure", "message": str(e), "exception": type(e).__name__}
+
+    def get_state(self):
+        """Return current circuit state."""
+        with self.lock:
+            return {
+                "state": self.state,
+                "failure_count": self.failure_count,
+                "last_failure_time": self.last_failure_time
+            }
+
+    def reset(self):
+        """Manually reset circuit breaker."""
+        with self.lock:
+            logger.info(f"🔌 Circuit breaker '{self.name}' manually reset")
+            self.failure_count = 0
+            self.state = "CLOSED"
+            self.last_failure_time = None
+
+# Initialize circuit breakers for different services
+_CB_TECHNICAL = CircuitBreaker(failure_threshold=5, timeout=60, name="Technical API")
+_CB_NEWS = CircuitBreaker(failure_threshold=5, timeout=60, name="News API")
+_CB_BROKER = CircuitBreaker(failure_threshold=3, timeout=120, name="Broker API")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

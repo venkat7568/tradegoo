@@ -224,10 +224,12 @@ class TradingCrew:
         self.memory_file = DATA_DIR / "memory.json"
         self.incidents_file = DATA_DIR / "incidents.jsonl"
 
-        # Load memory
+        # Load memory (with thread-safe lock for concurrent access)
         self.memory = self._load_memory()
+        self.memory_lock = threading.Lock()  # CRITICAL: Protect memory from concurrent modification
         if self.min_confidence_gate is not None:
-            self.memory["confidence_gate"] = float(self.min_confidence_gate)
+            with self.memory_lock:
+                self.memory["confidence_gate"] = float(self.min_confidence_gate)
 
         # Initialize clients
         print("🔧 Initializing clients...")
@@ -360,9 +362,25 @@ class TradingCrew:
         }
 
     def _save_memory(self):
-        self.memory["last_update"] = datetime.now(IST).isoformat()
-        with open(self.memory_file, "w", encoding="utf-8") as f:
-            json.dump(self.memory, f, indent=2, ensure_ascii=False)
+        with self.memory_lock:
+            self.memory["last_update"] = datetime.now(IST).isoformat()
+            with open(self.memory_file, "w", encoding="utf-8") as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+
+    def _get_memory(self, key: str, default=None):
+        """Thread-safe memory read."""
+        with self.memory_lock:
+            return self.memory.get(key, default)
+
+    def _set_memory(self, key: str, value):
+        """Thread-safe memory write."""
+        with self.memory_lock:
+            self.memory[key] = value
+
+    def _update_memory(self, updates: Dict[str, Any]):
+        """Thread-safe memory bulk update."""
+        with self.memory_lock:
+            self.memory.update(updates)
 
     def _load_holdings(self) -> List[Dict[str, Any]]:
         if self.holdings_file.exists():
