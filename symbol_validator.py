@@ -12,20 +12,98 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # Common NSE symbol mappings (partial list - can be extended)
+# This helps normalize company names to their trading symbols
+# Format: "SEARCH_TERM" -> "TRADING_SYMBOL"
 SYMBOL_ALIASES = {
-    # Full name -> NSE symbol
+    # Vinati Organics
     "VINATI ORGANICS": "VINATIORGA",
     "VINATI": "VINATIORGA",
     "VINATIORGANICS": "VINATIORGA",
     "VINATIORG": "VINATIORGA",
+    "VINATIORGANIC": "VINATIORGA",
 
-    # Add more mappings as needed
+    # IT Companies
     "ITC": "ITC",
     "TCS": "TCS",
-    "RELIANCE": "RELIANCE",
-    "HFCL": "HFCL",
+    "TATA CONSULTANCY": "TCS",
+    "TATA CONSULTANCY SERVICES": "TCS",
     "INFY": "INFY",
     "INFOSYS": "INFY",
+    "INFOSYS LIMITED": "INFY",
+    "WIPRO": "WIPRO",
+    "WIPRO LIMITED": "WIPRO",
+    "HCLTECH": "HCLTECH",
+    "HCL TECHNOLOGIES": "HCLTECH",
+    "TECHM": "TECHM",
+    "TECH MAHINDRA": "TECHM",
+
+    # Banks
+    "HDFCBANK": "HDFCBANK",
+    "HDFC BANK": "HDFCBANK",
+    "ICICIBANK": "ICICIBANK",
+    "ICICI BANK": "ICICIBANK",
+    "SBIN": "SBIN",
+    "SBI": "SBIN",
+    "STATE BANK": "SBIN",
+    "KOTAKBANK": "KOTAKBANK",
+    "KOTAK MAHINDRA": "KOTAKBANK",
+    "AXISBANK": "AXISBANK",
+    "AXIS BANK": "AXISBANK",
+
+    # Conglomerates
+    "RELIANCE": "RELIANCE",
+    "RELIANCE INDUSTRIES": "RELIANCE",
+    "RIL": "RELIANCE",
+    "TATASTEEL": "TATASTEEL",
+    "TATA STEEL": "TATASTEEL",
+    "TATAMOTORS": "TATAMOTORS",
+    "TATA MOTORS": "TATAMOTORS",
+
+    # Pharma
+    "SUNPHARMA": "SUNPHARMA",
+    "SUN PHARMA": "SUNPHARMA",
+    "DRREDDY": "DRREDDY",
+    "DR REDDY": "DRREDDY",
+    "CIPLA": "CIPLA",
+    "DIVISLAB": "DIVISLAB",
+    "DIVI'S LAB": "DIVISLAB",
+
+    # Telecom
+    "BHARTIARTL": "BHARTIARTL",
+    "BHARTI AIRTEL": "BHARTIARTL",
+    "AIRTEL": "BHARTIARTL",
+    "HFCL": "HFCL",
+    "HFCL LIMITED": "HFCL",
+
+    # Auto
+    "MARUTI": "MARUTI",
+    "MARUTI SUZUKI": "MARUTI",
+    "M&M": "M&M",
+    "MAHINDRA": "M&M",
+    "BAJAJ-AUTO": "BAJAJ-AUTO",
+    "BAJAJ AUTO": "BAJAJ-AUTO",
+    "EICHERMOT": "EICHERMOT",
+    "EICHER MOTORS": "EICHERMOT",
+
+    # FMCG
+    "HINDUNILVR": "HINDUNILVR",
+    "HINDUSTAN UNILEVER": "HINDUNILVR",
+    "HUL": "HINDUNILVR",
+    "NESTLEIND": "NESTLEIND",
+    "NESTLE INDIA": "NESTLEIND",
+    "BRITANNIA": "BRITANNIA",
+    "ITC LTD": "ITC",
+    "ITC LIMITED": "ITC",
+
+    # Energy
+    "NTPC": "NTPC",
+    "NTPC LIMITED": "NTPC",
+    "POWERGRID": "POWERGRID",
+    "POWER GRID": "POWERGRID",
+    "ONGC": "ONGC",
+    "OIL AND NATURAL GAS": "ONGC",
+    "BPCL": "BPCL",
+    "BHARAT PETROLEUM": "BPCL",
 }
 
 def normalize_symbol(symbol: str) -> Tuple[bool, Optional[str], Optional[str]]:

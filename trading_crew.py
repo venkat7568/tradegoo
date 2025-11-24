@@ -705,6 +705,39 @@ Return JSON only:
             self._emit_status("decide_complete", decision)
             return decision
 
+        # CRITICAL: Validate instrument key BEFORE doing expensive analysis
+        # No instrument key = can't get technical data, can't execute trades
+        # So skip immediately to avoid wasting LLM/API calls
+        print(f"🔑 Looking up instrument key for {symbol}...")
+        try:
+            resolved = self.operator.tech.resolve(symbol)
+            if not resolved or not resolved.get("instrument_key"):
+                print(f"❌ No instrument key found for {symbol} - cannot trade or analyze")
+                decision = {
+                    "symbol": symbol,
+                    "direction": "SKIP",
+                    "reason": "no_instrument_key",
+                    "error": f"Could not resolve instrument key for symbol '{symbol}'. Symbol may not exist on NSE/BSE.",
+                    "timestamp": datetime.now(IST).isoformat(),
+                }
+                self._emit_status("decide_complete", decision)
+                return decision
+
+            instrument_key = resolved["instrument_key"]
+            print(f"✅ Found instrument key: {instrument_key}")
+
+        except Exception as e:
+            print(f"❌ Error looking up instrument key for {symbol}: {e}")
+            decision = {
+                "symbol": symbol,
+                "direction": "SKIP",
+                "reason": "instrument_key_lookup_failed",
+                "error": str(e),
+                "timestamp": datetime.now(IST).isoformat(),
+            }
+            self._emit_status("decide_complete", decision)
+            return decision
+
         news_desc = _tmpl(
             """Analyze news sentiment for $symbol (Mode $mode, Date $today).
 Steps:
