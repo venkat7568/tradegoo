@@ -44,8 +44,8 @@ def validate_environment_variables():
     recommended_vars = {
         "API_RATE_LIMIT_PER_SEC": "API rate limit per second (default: 10)",
         "API_RATE_LIMIT_PER_MIN": "API rate limit per minute (default: 100)",
-        "MAX_QTY_PER_ORDER": "Maximum quantity per order (default: 10000)",
-        "MAX_ORDER_VALUE": "Maximum order value in ₹ (default: 1000000)",
+        "INTRADAY_LEVERAGE": "Intraday leverage multiplier (default: 3.0)",
+        "DELIVERY_LEVERAGE": "Delivery leverage multiplier (default: 1.0)",
     }
 
     missing_required = []
@@ -89,8 +89,9 @@ def validate_environment_variables():
     print("✅ Environment variable validation passed")
     print(f"   - API rate limits: {os.getenv('API_RATE_LIMIT_PER_SEC', '10')} calls/sec, " +
           f"{os.getenv('API_RATE_LIMIT_PER_MIN', '100')} calls/min")
-    print(f"   - Max order: {os.getenv('MAX_QTY_PER_ORDER', '10000')} qty, " +
-          f"₹{os.getenv('MAX_ORDER_VALUE', '1000000')} value")
+    print(f"   - Leverage: {os.getenv('INTRADAY_LEVERAGE', '3.0')}x intraday, " +
+          f"{os.getenv('DELIVERY_LEVERAGE', '1.0')}x delivery")
+    print("   ✅ Capital & qty limits: Fetched from Upstox in real-time")
     print("")
 
 # Run validation before importing any modules that depend on env vars
