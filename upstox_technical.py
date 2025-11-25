@@ -503,49 +503,64 @@ class UpstoxTechnicalClient:
         prev_close = TA.closes(candles)[1] if len(candles)>1 else None
         change_pct = ((last_close - prev_close)/prev_close*100.0) if (last_close and prev_close) else None
 
-        # labeled recent candles
-        labeled: List[Dict[str, Any]] = []
-        for c in candles[: max(20, min(200, len(candles)))]:
-            labeled.append({
-                "timestamp": c[0],
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": (float(c[5]) if len(c)>5 and c[5] is not None else None),
-                "oi": (float(c[6]) if len(c)>6 and c[6] is not None else None),
-            })
+        # Calculate support/resistance from recent 20 candles
+        recent_highs = highs[-20:] if len(highs) >= 20 else highs
+        recent_lows = lows[-20:] if len(lows) >= 20 else lows
+        resistance = _round(max(recent_highs)) if recent_highs else None
+        support = _round(min(recent_lows)) if recent_lows else None
 
-        latest = labeled[0] if labeled else None
+        # Trend analysis
+        trend = "neutral"
+        if ema20 and ema50 and sma20 and sma50:
+            if ema20 > ema50 and sma20 > sma50:
+                trend = "bullish"
+            elif ema20 < ema50 and sma20 < sma50:
+                trend = "bearish"
 
+        # Signal strength
+        signal_strength = "neutral"
+        if rsi14:
+            if rsi14 > 70:
+                signal_strength = "overbought"
+            elif rsi14 < 30:
+                signal_strength = "oversold"
+            elif rsi14 > 60:
+                signal_strength = "strong_bullish"
+            elif rsi14 < 40:
+                signal_strength = "weak_bearish"
+
+        # Momentum
+        momentum = "neutral"
+        if macd and signal and hist:
+            if hist > 0 and macd > signal:
+                momentum = "positive"
+            elif hist < 0 and macd < signal:
+                momentum = "negative"
+
+        # OPTIMIZED: Return only essential data for agents
         return {
-            "query": symbol_or_name,
-            "instrument_key": ik,
             "symbol": row.get("symbol"),
-            "company_name": row.get("name"),
-            "interval": "30minute",
-            "lookback_days": days,
-            "current_price": _round(ltp_val if ltp_val is not None else last_close),
-            "price_source": ltp_src if ltp_val is not None else "last_candle",
-            "last_close": _round(last_close),
-            "prev_close": _round(prev_close),
-            "change_percent": _round(change_pct),
-            "latest_candle": latest,
+            "name": row.get("name"),
+            "price": _round(ltp_val if ltp_val is not None else last_close),
+            "change_pct": _round(change_pct),
+            "trend": trend,
+            "signal_strength": signal_strength,
+            "momentum": momentum,
+            "support": support,
+            "resistance": resistance,
             "indicators": {
+                "rsi": _round(rsi14),
+                "macd": _round(macd),
+                "macd_signal": _round(signal),
+                "atr": _round(atr14),
+                "vwap": _round(vwap),
+            },
+            "moving_averages": {
                 "sma20": _round(sma20),
                 "sma50": _round(sma50),
                 "ema20": _round(ema20),
                 "ema50": _round(ema50),
-                "rsi14": _round(rsi14),
-                "macd": _round(macd),
-                "signal": _round(signal),
-                "hist": _round(hist),
-                "atr14": _round(atr14),
-                "vwap_today": _round(vwap),
             },
-            "candles": labeled,  # most-recent first
-            "generated_at": dt.datetime.now(tz=self.IST).isoformat(),
-            "data_source": "upstox.combined",
         }
 
 
