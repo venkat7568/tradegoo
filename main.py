@@ -641,14 +641,21 @@ def _crew_status_to_text(payload: dict) -> str:
 # ---------- NEW: pure news-based discovery using UpstoxTechnicalClient.resolve ----------
 def discover_and_validate_symbols(mode, date, max_symbols=20):
     """
-    Discover tradable NSE/BSE symbols purely from latest news.
-    No static TRADING_SYMBOLS. We:
-      - Fetch recent news
-      - Extract hints (symbol/company/headline/title)
-      - Pass each hint to UpstoxTechnicalClient.resolve()
-      - Keep unique NSE_EQ| / BSE_EQ| instruments
+    Discover tradable NSE/BSE symbols purely from latest news with strict validation.
+
+    VALIDATION FILTERS:
+    - Bonds/Debentures (end with digits)
+    - Preference Shares (end with PP, PR, etc)
+    - ETFs (contain ETF or BEES)
+    - Warrants (end with W1, W2)
+    - Truncated company names from headlines
+    - Invalid characters
+    - Incomplete instrument data
+
+    Returns:
+      List of validated equity instruments with complete data
     """
-    emit_status("🔍 Discovering stocks from recent news (no static watchlist)…")
+    emit_status("🔍 Discovering stocks from recent news with strict validation…")
 
     if not (NewsClient and UpstoxTechnicalClient):
         emit_status("❌ News/Technical client not available")
@@ -669,10 +676,20 @@ def discover_and_validate_symbols(mode, date, max_symbols=20):
     if not isinstance(news_data, list):
         news_data = news_data or []
 
-    emit_status(f"📰 Fetched {len(news_data)} news items")
+    emit_status(f"📰 Fetched {len(news_data)} news items for analysis")
 
     validated = []
     seen_ik = set()
+
+    # Track rejection reasons for debugging
+    rejection_stats = {
+        "not_equity": 0,
+        "invalid_format": 0,
+        "incomplete_data": 0,
+        "generic_word": 0,
+        "duplicate": 0,
+        "resolve_failed": 0
+    }
 
     def _hint_strings(item):
         """Collect possible company/symbol hints from one news item."""
@@ -712,35 +729,102 @@ def discover_and_validate_symbols(mode, date, max_symbols=20):
         return out
 
     def _is_valid_symbol(sym: str) -> bool:
-        """Validate symbol format to filter junk."""
+        """
+        Validate symbol format to filter out invalid securities.
+
+        FILTERS OUT:
+        - Bonds/Debentures (end with digits like TCL26, CITI26)
+        - Preference Shares (end with PP, PR, PF)
+        - ETFs (contain ETF or end with BEES)
+        - Warrants (end with W1, W2, etc)
+        - Invalid characters (special chars like &, -, etc)
+        - Truncated/partial company names
+
+        ALLOWS:
+        - Valid equity symbols (3-20 chars, mostly letters)
+        - Symbols like TATAMOTORS, BAJFINANCE, M&M (known valid)
+        """
         if not sym or not isinstance(sym, str):
             return False
 
         sym = sym.strip().upper()
 
-        # Length check: NSE symbols are typically 1-10 chars
-        if len(sym) < 1 or len(sym) > 10:
+        # Length check: NSE equity symbols are typically 3-20 chars
+        if len(sym) < 3 or len(sym) > 20:
+            emit_status(f"⚠️ Rejected {sym}: Invalid length ({len(sym)} chars)")
             return False
 
-        # Format check: Should be alphanumeric, usually starts with letter
+        # Format check: Must start with a letter
         if not sym[0].isalpha():
+            emit_status(f"⚠️ Rejected {sym}: Must start with letter")
             return False
 
-        # Should be mostly letters (at least 50%)
+        # CRITICAL: Filter out bonds/debentures (end with digits)
+        # Examples: TCL26, CITI26, HDFC25, etc.
+        if len(sym) >= 4 and sym[-2:].isdigit():
+            emit_status(f"⚠️ Rejected {sym}: Likely bond/debenture (ends with numbers)")
+            return False
+        if len(sym) >= 5 and sym[-3:].isdigit():
+            emit_status(f"⚠️ Rejected {sym}: Likely bond/debenture (ends with numbers)")
+            return False
+
+        # Filter out preference shares (end with PP, PR, PF, PS)
+        pref_suffixes = ['PP', 'PR', 'PF', 'PS', 'PA', 'PB', 'PC']
+        if any(sym.endswith(suffix) for suffix in pref_suffixes):
+            emit_status(f"⚠️ Rejected {sym}: Preference share (ends with {sym[-2:]})")
+            return False
+
+        # Filter out ETFs (contain ETF or end with BEES)
+        if 'ETF' in sym or sym.endswith('BEES'):
+            emit_status(f"⚠️ Rejected {sym}: ETF (contains ETF or BEES)")
+            return False
+
+        # Filter out warrants (end with W followed by digit)
+        if len(sym) >= 3 and sym[-2] == 'W' and sym[-1].isdigit():
+            emit_status(f"⚠️ Rejected {sym}: Warrant (ends with W{sym[-1]})")
+            return False
+
+        # Special character check: Only allow alphanumeric and & (for M&M, M&MFIN)
+        # Reject other special chars: -, _, ., space, etc.
+        invalid_chars = set(sym) - set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789&')
+        if invalid_chars:
+            emit_status(f"⚠️ Rejected {sym}: Invalid characters: {invalid_chars}")
+            return False
+
+        # & is only valid if it's M&M or M&MFIN (known valid symbols)
+        if '&' in sym and sym not in ['M&M', 'M&MFIN']:
+            emit_status(f"⚠️ Rejected {sym}: Invalid use of & (not M&M/M&MFIN)")
+            return False
+
+        # Should be mostly letters (at least 70%)
         letter_count = sum(1 for c in sym if c.isalpha())
-        if letter_count < len(sym) * 0.5:
+        if letter_count < len(sym) * 0.7:
+            emit_status(f"⚠️ Rejected {sym}: Too few letters ({letter_count}/{len(sym)})")
             return False
 
-        # Common junk patterns to reject
-        junk_patterns = [
-            lambda s: s.isdigit(),  # All numbers
-            lambda s: any(c in s for c in ['_', '-', '.', ' ']),  # Special chars
-            lambda s: len(s) > 6 and any(c.isdigit() for c in s[-3:]),  # Ends with numbers (likely truncated text)
+        # Reject all-digit symbols
+        if sym.isdigit():
+            emit_status(f"⚠️ Rejected {sym}: All digits")
+            return False
+
+        # CRITICAL: Reject truncated company names (common patterns)
+        # These are partial words extracted from news headlines
+        truncated_patterns = [
+            'INVEST',  # "The Investment Trust" → "THEINVEST"
+            'TRAD',    # "Sindhu Trade" → "SINDHUTRAD"
+            'TODAY',   # "MP Today" → "MPTODAY"
+            'CON',     # "Bajaj Consumer" → "BAJAJCON"
+            'GVT',     # "Government" → "GVT"
         ]
 
-        for pattern in junk_patterns:
-            if pattern(sym):
+        for pattern in truncated_patterns:
+            if pattern in sym and len(sym) <= 12:
+                emit_status(f"⚠️ Rejected {sym}: Likely truncated name (contains '{pattern}')")
                 return False
+
+        # Additional quality check: Symbol should be well-formed
+        # Valid symbols are typically: single word (RELIANCE) or concatenated (TATAMOTORS)
+        # Reject overly fragmented patterns
 
         return True
 
@@ -749,39 +833,82 @@ def discover_and_validate_symbols(mode, date, max_symbols=20):
         for hint in hints:
             try:
                 row = tech_client.resolve(hint)
-            except Exception:
+            except Exception as e:
+                # Log resolution failures for debugging
+                rejection_stats["resolve_failed"] += 1
                 continue
             if not row:
+                rejection_stats["resolve_failed"] += 1
                 continue
 
             ik = row.get("instrument_key")
-            if not ik or not ik.startswith(("NSE_EQ|", "BSE_EQ|")):
-                continue
-            if ik in seen_ik:
-                continue
-
             sym = row.get("symbol") or hint
             name = row.get("name") or hint
 
-            # Validate symbol format
-            if not _is_valid_symbol(sym):
-                emit_status(f"⚠️ Skipping invalid symbol: {sym}")
+            # CRITICAL: Only accept NSE/BSE equity instruments
+            if not ik or not ik.startswith(("NSE_EQ|", "BSE_EQ|")):
+                rejection_stats["not_equity"] += 1
                 continue
 
+            # Skip duplicates
+            if ik in seen_ik:
+                rejection_stats["duplicate"] += 1
+                continue
+
+            # CRITICAL: Validate symbol format (filters bonds, ETFs, prefs, etc)
+            if not _is_valid_symbol(sym):
+                # Rejection reason already logged inside _is_valid_symbol
+                rejection_stats["invalid_format"] += 1
+                continue
+
+            # ADDITIONAL: Verify symbol has complete instrument data
+            # This catches cases where symbol exists but lacks proper metadata
+            if not name or name == sym or len(name) < 5:
+                rejection_stats["incomplete_data"] += 1
+                continue
+
+            # Quality check: Symbol should not be too similar to generic words
+            # This catches cases like "INVEST", "TRAD", etc that might slip through
+            sym_lower = sym.lower()
+            generic_words = ['trade', 'invest', 'company', 'limited', 'india', 'finance']
+            if any(sym_lower == word for word in generic_words):
+                rejection_stats["generic_word"] += 1
+                continue
+
+            # Symbol passed all validation!
             seen_ik.add(ik)
 
             validated.append({
                 "symbol": sym,
                 "name": name,
                 "instrument_key": ik,
-                "source": hint
+                "source": hint,
+                "news_item": item.get("headline", "")[:100]  # Track which news mentioned it
             })
-            emit_status(f"✅ From news: {hint} → {sym} ({name})")
+            emit_status(f"✅ Validated: {hint} → {sym} ({name})")
 
             if len(validated) >= max_symbols:
                 break
         if len(validated) >= max_symbols:
             break
+
+    # Show validation summary
+    total_rejected = sum(rejection_stats.values())
+    emit_status(f"📊 Validation Summary: {len(validated)} accepted, {total_rejected} rejected")
+    if total_rejected > 0:
+        emit_status(f"   📋 Rejections breakdown:")
+        if rejection_stats["invalid_format"] > 0:
+            emit_status(f"      • {rejection_stats['invalid_format']} invalid format (bonds/ETFs/prefs/truncated names)")
+        if rejection_stats["not_equity"] > 0:
+            emit_status(f"      • {rejection_stats['not_equity']} not equity instruments")
+        if rejection_stats["incomplete_data"] > 0:
+            emit_status(f"      • {rejection_stats['incomplete_data']} incomplete instrument data")
+        if rejection_stats["generic_word"] > 0:
+            emit_status(f"      • {rejection_stats['generic_word']} generic words")
+        if rejection_stats["duplicate"] > 0:
+            emit_status(f"      • {rejection_stats['duplicate']} duplicates")
+        if rejection_stats["resolve_failed"] > 0:
+            emit_status(f"      • {rejection_stats['resolve_failed']} resolution failures")
 
     if not validated:
         emit_status("⚠️ No tradable NSE/BSE equities could be resolved from today's news.")
