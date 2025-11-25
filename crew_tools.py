@@ -70,15 +70,16 @@ class Config:
     """
     Centralized configuration from environment variables.
     Provides type-safe access with defaults.
+
+    NOTE: Capital and quantity limits come from Upstox dynamically via get_funds().
+    We don't hardcode MAX_QTY or MAX_VALUE - they're calculated based on real available funds.
     """
     # Rate limiting
     API_RATE_LIMIT_PER_SEC = int(os.environ.get("API_RATE_LIMIT_PER_SEC", "10"))
     API_RATE_LIMIT_PER_MIN = int(os.environ.get("API_RATE_LIMIT_PER_MIN", "100"))
 
-    # Risk management
-    MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
-    MAX_ORDER_VALUE = float(os.environ.get("MAX_ORDER_VALUE", "1000000"))  # ₹10 lakh
-    MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # ₹1 lakh
+    # Risk management - ONLY sanity check for obviously bad prices
+    MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # ₹1 lakh sanity check
 
     # Caching
     NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))  # 5 minutes
@@ -95,7 +96,7 @@ class Config:
     CB_BROKER_FAILURE_THRESHOLD = int(os.environ.get("CB_BROKER_FAILURE_THRESHOLD", "3"))
     CB_BROKER_TIMEOUT = int(os.environ.get("CB_BROKER_TIMEOUT", "120"))
 
-    # Leverage defaults
+    # Leverage defaults (used with REAL capital from Upstox)
     INTRADAY_LEVERAGE = float(os.environ.get("INTRADAY_LEVERAGE", "3.0"))
     DELIVERY_LEVERAGE = float(os.environ.get("DELIVERY_LEVERAGE", "1.0"))
 
@@ -108,10 +109,12 @@ class Config:
         return f"""
 Configuration Summary:
   Rate Limits: {cls.API_RATE_LIMIT_PER_SEC} calls/sec, {cls.API_RATE_LIMIT_PER_MIN} calls/min
-  Risk Limits: Max {cls.MAX_QTY_PER_ORDER} qty, ₹{cls.MAX_ORDER_VALUE:.0f} value
+  Price Sanity: Max ₹{cls.MAX_PRICE_PER_SHARE:.0f}/share (bad data check)
   Cache TTL: News {cls.NEWS_CACHE_TTL}s, Technical {cls.TECHNICAL_CACHE_TTL}s
   Circuit Breaker: {cls.CB_FAILURE_THRESHOLD} failures, {cls.CB_TIMEOUT}s timeout
   Leverage: Intraday {cls.INTRADAY_LEVERAGE}x, Delivery {cls.DELIVERY_LEVERAGE}x
+
+  ✅ Qty/Capital limits: Fetched from Upstox in real-time (no hardcoded limits)
 """
 
 # Log configuration on startup
@@ -1173,35 +1176,25 @@ def place_order_tool(input_str=None, **kw) -> str:
         p.get("target"), p.get("target_pct")
     )
 
-    # CRITICAL: Risk validation on order parameters (MUST happen before placing order!)
+    # CRITICAL: Basic validation (qty/capital limits come from Upstox dynamically)
     qty = p.get("qty")
     price = p.get("price", 0)
     symbol = p.get("symbol", "UNKNOWN")
 
-    # Validate quantity
+    # Validate quantity is positive (actual max qty comes from calculate_max_quantity_tool using real capital)
     if qty is None or qty <= 0:
         logger.error(f"❌ RISK CHECK FAILED: Invalid quantity {qty} for {symbol}")
         return _json_fail("invalid_quantity", detail=f"Quantity must be positive, got {qty}")
 
-    # Maximum quantity sanity check (configurable via env var)
-    MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
-    if qty > MAX_QTY_PER_ORDER:
-        logger.error(f"❌ RISK CHECK FAILED: Quantity {qty} exceeds max {MAX_QTY_PER_ORDER} for {symbol}")
-        return _json_fail("quantity_exceeds_max", detail=f"Quantity {qty} exceeds maximum {MAX_QTY_PER_ORDER} per order")
-
-    # Maximum order value sanity check (for LIMIT orders)
+    # Price sanity check ONLY (prevent obviously bad data like ₹5 lakh/share)
     if price and price > 0:
-        order_value = qty * price
-        MAX_ORDER_VALUE = float(os.environ.get("MAX_ORDER_VALUE", "1000000"))  # Default: ₹10 lakh
-        if order_value > MAX_ORDER_VALUE:
-            logger.error(f"❌ RISK CHECK FAILED: Order value ₹{order_value:.2f} exceeds max ₹{MAX_ORDER_VALUE:.2f} for {symbol}")
-            return _json_fail("order_value_exceeds_max", detail=f"Order value ₹{order_value:.2f} exceeds maximum ₹{MAX_ORDER_VALUE:.2f}")
+        if price > Config.MAX_PRICE_PER_SHARE:
+            logger.error(f"❌ SANITY CHECK FAILED: Price ₹{price} exceeds ₹{Config.MAX_PRICE_PER_SHARE} for {symbol}")
+            return _json_fail("price_too_high", detail=f"Price ₹{price} seems wrong (max ₹{Config.MAX_PRICE_PER_SHARE})")
 
-        # Price sanity check (prevent absurdly high prices)
-        MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # Default: ₹1 lakh/share
-        if price > MAX_PRICE_PER_SHARE:
-            logger.error(f"❌ RISK CHECK FAILED: Price ₹{price} exceeds max ₹{MAX_PRICE_PER_SHARE} for {symbol}")
-            return _json_fail("price_exceeds_max", detail=f"Price ₹{price} exceeds maximum ₹{MAX_PRICE_PER_SHARE} per share")
+    # NOTE: Qty and capital limits are calculated dynamically:
+    # - calculate_max_quantity_tool uses real available funds from Upstox
+    # - Agents should call that tool to determine safe qty before placing order
 
     # IMPORTANT: Log warning if live=False to make paper trading explicit
     if not p.get("live"):
@@ -1292,17 +1285,13 @@ def place_intraday_bracket_tool(input_str=None, **kw) -> str:
         p.get("auto_size")
     )
 
-    # CRITICAL: Risk validation on order parameters (same as place_order_tool)
+    # CRITICAL: Basic validation (qty limits from Upstox capital, not hardcoded)
     qty = p.get("qty")
     if qty is not None:  # auto_size might not have qty
         if qty <= 0:
             logger.error(f"❌ RISK CHECK FAILED: Invalid quantity {qty} for {symbol}")
             return _json_fail("invalid_quantity", detail=f"Quantity must be positive, got {qty}")
-
-        MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
-        if qty > MAX_QTY_PER_ORDER:
-            logger.error(f"❌ RISK CHECK FAILED: Quantity {qty} exceeds max {MAX_QTY_PER_ORDER} for {symbol}")
-            return _json_fail("quantity_exceeds_max", detail=f"Quantity {qty} exceeds maximum {MAX_QTY_PER_ORDER} per order")
+        # NOTE: Max qty comes from calculate_max_quantity_tool using real Upstox capital
 
     try:
         res = get_operator_instance().place_order(**p)
