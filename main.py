@@ -21,6 +21,76 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# CRITICAL: Validate required environment variables at startup (fail-fast)
+def validate_environment_variables():
+    """
+    Validate that all required environment variables are set.
+    Fails fast with clear error messages if anything is missing.
+    """
+    # Required API keys
+    required_vars = {
+        "UPSTOX_API_KEY": "Upstox API key for broker integration",
+        "UPSTOX_API_SECRET": "Upstox API secret for authentication",
+        "UPSTOX_REDIRECT_URI": "Upstox OAuth redirect URI",
+        "OPENAI_API_KEY": "OpenAI API key for LLM agents",
+    }
+
+    # Optional but recommended
+    recommended_vars = {
+        "API_RATE_LIMIT_PER_SEC": "API rate limit per second (default: 10)",
+        "API_RATE_LIMIT_PER_MIN": "API rate limit per minute (default: 100)",
+        "MAX_QTY_PER_ORDER": "Maximum quantity per order (default: 10000)",
+        "MAX_ORDER_VALUE": "Maximum order value in ₹ (default: 1000000)",
+    }
+
+    missing_required = []
+    missing_recommended = []
+
+    # Check required variables
+    for var_name, description in required_vars.items():
+        value = os.getenv(var_name)
+        if not value or value.strip() == "":
+            missing_required.append(f"  ❌ {var_name}: {description}")
+
+    # Check recommended variables
+    for var_name, description in recommended_vars.items():
+        value = os.getenv(var_name)
+        if not value or value.strip() == "":
+            missing_recommended.append(f"  ⚠️  {var_name}: {description}")
+
+    # Report results
+    if missing_required:
+        error_msg = "\n" + "="*70 + "\n"
+        error_msg += "🔴 CRITICAL ERROR: Missing required environment variables!\n"
+        error_msg += "="*70 + "\n"
+        error_msg += "\nThe following required variables are not set:\n\n"
+        error_msg += "\n".join(missing_required)
+        error_msg += "\n\nPlease set these in your .env file or environment.\n"
+        error_msg += "="*70 + "\n"
+        print(error_msg, file=sys.stderr)
+        sys.exit(1)
+
+    if missing_recommended:
+        warning_msg = "\n" + "="*70 + "\n"
+        warning_msg += "⚠️  WARNING: Missing recommended environment variables\n"
+        warning_msg += "="*70 + "\n"
+        warning_msg += "\nThe following recommended variables are not set (using defaults):\n\n"
+        warning_msg += "\n".join(missing_recommended)
+        warning_msg += "\n\nConsider setting these for better control.\n"
+        warning_msg += "="*70 + "\n"
+        print(warning_msg, file=sys.stderr)
+
+    # Success message
+    print("✅ Environment variable validation passed")
+    print(f"   - API rate limits: {os.getenv('API_RATE_LIMIT_PER_SEC', '10')} calls/sec, " +
+          f"{os.getenv('API_RATE_LIMIT_PER_MIN', '100')} calls/min")
+    print(f"   - Max order: {os.getenv('MAX_QTY_PER_ORDER', '10000')} qty, " +
+          f"₹{os.getenv('MAX_ORDER_VALUE', '1000000')} value")
+    print("")
+
+# Run validation before importing any modules that depend on env vars
+validate_environment_variables()
+
 # Local modules
 from trading_crew import TradingCrew
 import logging
@@ -145,8 +215,58 @@ if env_warnings:
         print(f"  • {warning}")
     print("="*70 + "\n")
 
-# Max number of different symbols we’ll trade per cycle (NOT a restriction by name)
+# Max number of different symbols we'll trade per cycle (NOT a restriction by name)
 MAX_DISCOVERED_SYMBOLS = int(os.environ.get("MAX_DISCOVERED_SYMBOLS", "20"))
+
+
+# ============================================================================
+# GRACEFUL SHUTDOWN HANDLING
+# ============================================================================
+import signal
+import atexit
+
+_shutdown_handlers = []
+
+def register_shutdown_handler(handler):
+    """Register a function to be called on shutdown."""
+    _shutdown_handlers.append(handler)
+
+def graceful_shutdown(signum=None, frame=None):
+    """Handle graceful shutdown of the application."""
+    print("\n" + "="*70)
+    print("🛑 Graceful shutdown initiated...")
+    print("="*70)
+
+    # Call all registered shutdown handlers
+    for handler in _shutdown_handlers:
+        try:
+            handler()
+        except Exception as e:
+            print(f"⚠️  Error during shutdown handler: {e}")
+
+    # Flush logs
+    try:
+        logging.shutdown()
+        print("✅ Logs flushed")
+    except Exception as e:
+        print(f"⚠️  Error flushing logs: {e}")
+
+    print("="*70)
+    print("👋 Shutdown complete")
+    print("="*70)
+
+    if signum is not None:
+        sys.exit(0)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGINT, graceful_shutdown)   # Ctrl+C
+signal.signal(signal.SIGTERM, graceful_shutdown)  # kill command
+
+# Register atexit handler as fallback
+atexit.register(lambda: graceful_shutdown())
+
+trade_logger.info("✅ Graceful shutdown handlers registered")
+
 
 app = Flask(__name__)
 # SECURITY: Flask SECRET_KEY must be set in environment - no hardcoded default

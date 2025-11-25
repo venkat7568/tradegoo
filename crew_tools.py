@@ -64,6 +64,60 @@ if not logger.handlers:
 logger.setLevel(os.environ.get("CREW_TOOLS_LOG_LEVEL", "INFO").upper())
 logger.info("crew_tools initialized, log file: %s", LOG_DIR / "crew_tools.log")
 
+
+# ---- Centralized Configuration Management ----
+class Config:
+    """
+    Centralized configuration from environment variables.
+    Provides type-safe access with defaults.
+    """
+    # Rate limiting
+    API_RATE_LIMIT_PER_SEC = int(os.environ.get("API_RATE_LIMIT_PER_SEC", "10"))
+    API_RATE_LIMIT_PER_MIN = int(os.environ.get("API_RATE_LIMIT_PER_MIN", "100"))
+
+    # Risk management
+    MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
+    MAX_ORDER_VALUE = float(os.environ.get("MAX_ORDER_VALUE", "1000000"))  # ₹10 lakh
+    MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # ₹1 lakh
+
+    # Caching
+    NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))  # 5 minutes
+    TECHNICAL_CACHE_TTL = int(os.environ.get("TECHNICAL_CACHE_TTL", "25"))  # 25 seconds
+
+    # Input validation
+    MAX_NEWS_QUERY_LENGTH = int(os.environ.get("MAX_NEWS_QUERY_LENGTH", "200"))
+    MAX_SYMBOL_LENGTH = int(os.environ.get("MAX_SYMBOL_LENGTH", "50"))
+    MAX_DAYS_LOOKBACK = int(os.environ.get("MAX_DAYS_LOOKBACK", "365"))
+
+    # Circuit breaker
+    CB_FAILURE_THRESHOLD = int(os.environ.get("CB_FAILURE_THRESHOLD", "5"))
+    CB_TIMEOUT = int(os.environ.get("CB_TIMEOUT", "60"))  # seconds
+    CB_BROKER_FAILURE_THRESHOLD = int(os.environ.get("CB_BROKER_FAILURE_THRESHOLD", "3"))
+    CB_BROKER_TIMEOUT = int(os.environ.get("CB_BROKER_TIMEOUT", "120"))
+
+    # Leverage defaults
+    INTRADAY_LEVERAGE = float(os.environ.get("INTRADAY_LEVERAGE", "3.0"))
+    DELIVERY_LEVERAGE = float(os.environ.get("DELIVERY_LEVERAGE", "1.0"))
+
+    # Tick size
+    TICK_SIZE = float(os.environ.get("TICK_SIZE", "0.05"))
+
+    @classmethod
+    def summary(cls) -> str:
+        """Return a formatted summary of all configuration values."""
+        return f"""
+Configuration Summary:
+  Rate Limits: {cls.API_RATE_LIMIT_PER_SEC} calls/sec, {cls.API_RATE_LIMIT_PER_MIN} calls/min
+  Risk Limits: Max {cls.MAX_QTY_PER_ORDER} qty, ₹{cls.MAX_ORDER_VALUE:.0f} value
+  Cache TTL: News {cls.NEWS_CACHE_TTL}s, Technical {cls.TECHNICAL_CACHE_TTL}s
+  Circuit Breaker: {cls.CB_FAILURE_THRESHOLD} failures, {cls.CB_TIMEOUT}s timeout
+  Leverage: Intraday {cls.INTRADAY_LEVERAGE}x, Delivery {cls.DELIVERY_LEVERAGE}x
+"""
+
+# Log configuration on startup
+logger.info("Configuration loaded: %s", Config.summary().strip())
+
+
 # ---- singletons ----
 NEWS = NewsClient()
 TECH = UpstoxTechnicalClient()
@@ -87,6 +141,18 @@ def set_operator_instance(operator_instance):
     with _operator_lock:
         OP = operator_instance
         logger.info("✅ Global operator instance updated for tools")
+
+def get_operator_instance():
+    """
+    Thread-safe getter for the global operator instance.
+
+    CRITICAL: Use this instead of accessing OP directly to prevent race conditions.
+
+    Returns:
+        UpstoxOperator: The current operator instance
+    """
+    with _operator_lock:
+        return OP
 
 # ---- bounded in-memory caches with LRU eviction ----
 
@@ -118,6 +184,193 @@ class BoundedCache:
 _SNAP_CACHE = BoundedCache(maxsize=100)  # Limit to 100 snapshots
 _NEWS_CACHE = BoundedCache(maxsize=50)   # Limit to 50 news cache entries
 _LAST_CALL_TS: Dict[str, int] = {}       # per-key debounce ms timestamp (kept small by design)
+
+
+# ---- System-wide rate limiter to prevent broker bans ----
+class SystemRateLimiter:
+    """
+    System-wide rate limiter using sliding window algorithm.
+    Prevents API overload across ALL tools to avoid broker bans.
+    """
+    def __init__(self, max_calls_per_second=10, max_calls_per_minute=100):
+        self.max_per_second = max_calls_per_second
+        self.max_per_minute = max_calls_per_minute
+        self.calls_second = []  # List of timestamps in last second
+        self.calls_minute = []  # List of timestamps in last minute
+        self.lock = threading.Lock()
+        logger.info(f"🛡️  System rate limiter initialized: {max_calls_per_second} calls/sec, {max_calls_per_minute} calls/min")
+
+    def wait_if_needed(self, operation_name="API"):
+        """
+        Block if rate limit would be exceeded, return when safe to proceed.
+
+        Args:
+            operation_name: Name of operation for logging
+        """
+        with self.lock:
+            now = time.time()
+
+            # Clean up old timestamps (older than 1 minute)
+            self.calls_second = [t for t in self.calls_second if now - t < 1.0]
+            self.calls_minute = [t for t in self.calls_minute if now - t < 60.0]
+
+            # Check per-second limit
+            if len(self.calls_second) >= self.max_per_second:
+                oldest_call = self.calls_second[0]
+                wait_time = 1.0 - (now - oldest_call)
+                if wait_time > 0:
+                    logger.warning(
+                        f"⏳ Rate limit reached ({self.max_per_second} calls/sec). "
+                        f"Waiting {wait_time:.2f}s before {operation_name}..."
+                    )
+                    time.sleep(wait_time)
+                    now = time.time()  # Update after sleep
+                    # Clean again after sleep
+                    self.calls_second = [t for t in self.calls_second if now - t < 1.0]
+
+            # Check per-minute limit
+            if len(self.calls_minute) >= self.max_per_minute:
+                oldest_call = self.calls_minute[0]
+                wait_time = 60.0 - (now - oldest_call)
+                if wait_time > 0:
+                    logger.warning(
+                        f"⏳ Rate limit reached ({self.max_per_minute} calls/min). "
+                        f"Waiting {wait_time:.2f}s before {operation_name}..."
+                    )
+                    time.sleep(wait_time)
+                    now = time.time()  # Update after sleep
+                    # Clean again after sleep
+                    self.calls_minute = [t for t in self.calls_minute if now - t < 60.0]
+
+            # Record this call
+            self.calls_second.append(now)
+            self.calls_minute.append(now)
+
+    def get_stats(self):
+        """Return current rate limit stats."""
+        with self.lock:
+            now = time.time()
+            self.calls_second = [t for t in self.calls_second if now - t < 1.0]
+            self.calls_minute = [t for t in self.calls_minute if now - t < 60.0]
+            return {
+                "calls_last_second": len(self.calls_second),
+                "calls_last_minute": len(self.calls_minute),
+                "max_per_second": self.max_per_second,
+                "max_per_minute": self.max_per_minute
+            }
+
+# Initialize system-wide rate limiter (using centralized config)
+_SYSTEM_RATE_LIMITER = SystemRateLimiter(
+    max_calls_per_second=Config.API_RATE_LIMIT_PER_SEC,
+    max_calls_per_minute=Config.API_RATE_LIMIT_PER_MIN
+)
+
+
+# ---- Circuit Breaker for API failure handling ----
+class CircuitBreaker:
+    """
+    Circuit breaker pattern to prevent repeated calls to failing services.
+
+    States:
+    - CLOSED: Normal operation, calls go through
+    - OPEN: Service failing, calls blocked immediately
+    - HALF_OPEN: Testing if service recovered
+    """
+    def __init__(self, failure_threshold=5, timeout=60, name="API"):
+        self.failure_threshold = failure_threshold  # Failures before opening
+        self.timeout = timeout  # Seconds before trying again
+        self.name = name
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self.lock = threading.Lock()
+        logger.info(f"🔌 Circuit breaker '{name}' initialized: threshold={failure_threshold}, timeout={timeout}s")
+
+    def call(self, func, *args, **kwargs):
+        """
+        Execute function through circuit breaker.
+
+        Returns:
+            (success: bool, result: Any)
+        """
+        with self.lock:
+            # Check if circuit is OPEN
+            if self.state == "OPEN":
+                # Check if timeout has passed
+                if time.time() - self.last_failure_time >= self.timeout:
+                    logger.info(f"🔌 Circuit breaker '{self.name}': Entering HALF_OPEN state (testing recovery)")
+                    self.state = "HALF_OPEN"
+                else:
+                    # Still in timeout period
+                    logger.warning(f"⚡ Circuit breaker '{self.name}' is OPEN - call blocked")
+                    return False, {"error": "circuit_open", "message": f"{self.name} circuit breaker is OPEN"}
+
+        # Try the call (outside lock to avoid blocking other callers)
+        try:
+            result = func(*args, **kwargs)
+
+            # Success - reset failure count
+            with self.lock:
+                if self.state == "HALF_OPEN":
+                    logger.info(f"🔌 Circuit breaker '{self.name}': Service recovered, closing circuit")
+                self.failure_count = 0
+                self.state = "CLOSED"
+
+            return True, result
+
+        except Exception as e:
+            # Failure - increment count
+            with self.lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+
+                if self.failure_count >= self.failure_threshold:
+                    if self.state != "OPEN":
+                        logger.error(
+                            f"⚡ Circuit breaker '{self.name}' OPENED after {self.failure_count} failures. "
+                            f"Blocking calls for {self.timeout}s"
+                        )
+                    self.state = "OPEN"
+                else:
+                    logger.warning(
+                        f"⚠️  Circuit breaker '{self.name}': Failure {self.failure_count}/{self.failure_threshold}"
+                    )
+
+            return False, {"error": "api_failure", "message": str(e), "exception": type(e).__name__}
+
+    def get_state(self):
+        """Return current circuit state."""
+        with self.lock:
+            return {
+                "state": self.state,
+                "failure_count": self.failure_count,
+                "last_failure_time": self.last_failure_time
+            }
+
+    def reset(self):
+        """Manually reset circuit breaker."""
+        with self.lock:
+            logger.info(f"🔌 Circuit breaker '{self.name}' manually reset")
+            self.failure_count = 0
+            self.state = "CLOSED"
+            self.last_failure_time = None
+
+# Initialize circuit breakers for different services (using centralized config)
+_CB_TECHNICAL = CircuitBreaker(
+    failure_threshold=Config.CB_FAILURE_THRESHOLD,
+    timeout=Config.CB_TIMEOUT,
+    name="Technical API"
+)
+_CB_NEWS = CircuitBreaker(
+    failure_threshold=Config.CB_FAILURE_THRESHOLD,
+    timeout=Config.CB_TIMEOUT,
+    name="News API"
+)
+_CB_BROKER = CircuitBreaker(
+    failure_threshold=Config.CB_BROKER_FAILURE_THRESHOLD,
+    timeout=Config.CB_BROKER_TIMEOUT,
+    name="Broker API"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -224,21 +477,93 @@ def _extract_available_margin(funds: dict) -> float:
     return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Enhanced error handling and retry utilities
+# ---------------------------------------------------------------------------
+
+class ErrorType:
+    """Error type classification for smart retry logic."""
+    NETWORK = "network"           # Retriable - connection issues
+    RATE_LIMIT = "rate_limit"     # Retriable with backoff
+    AUTHENTICATION = "auth"        # Not retriable - fix credentials
+    VALIDATION = "validation"      # Not retriable - fix input
+    SERVER_ERROR = "server"        # Retriable - temporary server issue
+    UNKNOWN = "unknown"            # Retriable with caution
+
+def classify_error(e: Exception) -> str:
+    """
+    Classify exception into error types for smart retry logic.
+
+    Returns:
+        ErrorType constant
+    """
+    error_str = str(e).lower()
+    error_type_name = type(e).__name__.lower()
+
+    # Network errors - retriable
+    if any(x in error_type_name for x in ['connection', 'timeout', 'socket']):
+        return ErrorType.NETWORK
+    if any(x in error_str for x in ['connection', 'timeout', 'network', 'unreachable']):
+        return ErrorType.NETWORK
+
+    # Rate limit errors - retriable with backoff
+    if any(x in error_str for x in ['rate limit', 'too many requests', '429']):
+        return ErrorType.RATE_LIMIT
+
+    # Authentication errors - NOT retriable
+    if any(x in error_str for x in ['unauthorized', '401', '403', 'forbidden', 'api key', 'invalid token']):
+        return ErrorType.AUTHENTICATION
+
+    # Validation errors - NOT retriable
+    if any(x in error_str for x in ['invalid', 'validation', 'bad request', '400', 'missing required']):
+        return ErrorType.VALIDATION
+
+    # Server errors - retriable
+    if any(x in error_str for x in ['500', '502', '503', '504', 'internal server', 'bad gateway', 'service unavailable']):
+        return ErrorType.SERVER_ERROR
+
+    return ErrorType.UNKNOWN
+
 def _retry(plan_ms, fn):
     """
+    Enhanced retry with error type classification and exponential backoff with jitter.
+
     plan_ms: iterable of sleep milliseconds (0 for immediate)
     fn:      callable with no args
     returns (ok, value_or_errstr)
     """
     last_err = None
-    for ms in plan_ms:
+    last_err_type = None
+
+    for attempt, ms in enumerate(plan_ms, 1):
         try:
             return True, fn()
         except Exception as e:
+            # Classify error type
+            err_type = classify_error(e)
             last_err = f"{type(e).__name__}: {e}"
-            logger.warning("retry step failed (%sms): %s", ms, last_err)
+            last_err_type = err_type
+
+            # Check if error is retriable
+            if err_type in (ErrorType.AUTHENTICATION, ErrorType.VALIDATION):
+                logger.error(f"Non-retriable error ({err_type}): {last_err}")
+                return False, last_err
+
+            # Log with error type context
+            logger.warning(
+                f"Retry attempt {attempt}/{len(plan_ms)} failed ({err_type}): {last_err}"
+            )
+
+            # Apply sleep with jitter for exponential backoff
             if ms:
-                time.sleep(ms / 1000.0)
+                # Add 10% jitter to prevent thundering herd
+                import random
+                jitter = random.uniform(0.9, 1.1)
+                actual_sleep = (ms / 1000.0) * jitter
+                time.sleep(actual_sleep)
+
+    # All retries exhausted
+    logger.error(f"All retries exhausted. Last error type: {last_err_type}, error: {last_err}")
     return False, last_err
 
 
@@ -249,6 +574,91 @@ def _debounce(key: str, min_ms: int = 150) -> None:
     if now - last < min_ms:
         time.sleep((min_ms - (now - last)) / 1000.0)
     _LAST_CALL_TS[key] = int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Input validation utilities
+# ---------------------------------------------------------------------------
+
+def validate_symbol(symbol: str) -> tuple[bool, str]:
+    """
+    Validate trading symbol format.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not symbol or not isinstance(symbol, str):
+        return False, "Symbol must be a non-empty string"
+
+    symbol = symbol.strip()
+    if len(symbol) == 0:
+        return False, "Symbol cannot be empty"
+
+    if len(symbol) > 50:
+        return False, f"Symbol too long ({len(symbol)} chars, max 50)"
+
+    # Allow alphanumeric, hyphens, underscores, pipes (for instrument keys)
+    import re
+    if not re.match(r'^[A-Za-z0-9_\-|]+$', symbol):
+        return False, "Symbol contains invalid characters"
+
+    return True, ""
+
+def validate_positive_number(value, name: str, min_val=0, max_val=None) -> tuple[bool, str]:
+    """
+    Validate that a value is a positive number within bounds.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return False, f"{name} must be a valid number"
+
+    if num <= min_val:
+        return False, f"{name} must be greater than {min_val}"
+
+    if max_val is not None and num > max_val:
+        return False, f"{name} must be less than or equal to {max_val}"
+
+    return True, ""
+
+def validate_integer(value, name: str, min_val=None, max_val=None) -> tuple[bool, str]:
+    """
+    Validate that a value is an integer within bounds.
+
+    Returns:
+        (is_valid, error_message)
+    """
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return False, f"{name} must be a valid integer"
+
+    if min_val is not None and num < min_val:
+        return False, f"{name} must be at least {min_val}"
+
+    if max_val is not None and num > max_val:
+        return False, f"{name} must be at most {max_val}"
+
+    return True, ""
+
+def validate_side(side: str) -> tuple[bool, str]:
+    """
+    Validate order side (BUY/SELL).
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not side or not isinstance(side, str):
+        return False, "Side must be specified"
+
+    side = side.strip().upper()
+    if side not in ("BUY", "SELL"):
+        return False, f"Side must be BUY or SELL, got '{side}'"
+
+    return True, ""
 
 
 def _round_to_tick(px: float, tick: float) -> float:
@@ -288,15 +698,19 @@ def get_recent_news_tool(input_str=None, **kw) -> str:
             lookback_days, max_items, mode, today, compact
         )
 
-        # Debounce & short cache
+        # Debounce & cache (increased TTL to reduce API calls while keeping news reasonably fresh)
         _debounce(f"news:{lookback_days}:{max_items}:{compact}:{mode}", 150)
         now = time.time()
         ck = (lookback_days, max_items, compact, mode)
         cached = _NEWS_CACHE.get(ck)
-        if cached and (now - cached[0] <= 20):
+        NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))  # Default: 5 minutes
+        if cached and (now - cached[0] <= NEWS_CACHE_TTL):
             items = cached[1]["items"]
             logger.info("get_recent_news_tool returning %d cached items", len(items))
             return _json_ok(items=items, count=len(items), cached=True)
+
+        # CRITICAL: Apply system-wide rate limiting before API call
+        _SYSTEM_RATE_LIMITER.wait_if_needed("get_recent_news")
 
         # Retry ladder: shrink ask on retries
         ladder = [(max_items, 0), (max_items // 2 or 10, 250), (10, 500)]
@@ -347,6 +761,22 @@ def search_news_tool(input_str=None, **kw) -> str:
         if not q:
             logger.warning("search_news_tool missing query")
             return _json_fail("missing_query")
+
+        # SECURITY: Input sanitization to prevent injection attacks
+        # Remove potentially dangerous characters
+        import re
+        # Allow only alphanumeric, spaces, and basic punctuation
+        q = re.sub(r'[^\w\s\-\.,:;\'\"&()]+', '', q)
+
+        # Limit query length to prevent abuse
+        MAX_QUERY_LENGTH = int(os.environ.get("MAX_NEWS_QUERY_LENGTH", "200"))
+        if len(q) > MAX_QUERY_LENGTH:
+            logger.warning(f"search_news_tool: query truncated from {len(q)} to {MAX_QUERY_LENGTH} chars")
+            q = q[:MAX_QUERY_LENGTH]
+
+        if not q:  # Check again after sanitization
+            logger.warning("search_news_tool: query empty after sanitization")
+            return _json_fail("invalid_query", detail="Query contains only invalid characters")
 
         lookback_days = int(args.get("lookback_days", 7) or 7)
         max_results   = int(args.get("max_results", 25) or 25)
@@ -412,10 +842,24 @@ def get_technical_snapshot_tool(input_str=None, **kw) -> str:
     try:
         args = _coerce_args(input_str, **kw)
         symbol = (args.get("symbol") or args.get("query") or "").strip()
-        if not symbol:
-            logger.warning("get_technical_snapshot_tool: missing symbol")
-            return _json_fail("missing_symbol")
-        days = int(args.get("days", 7) or 7)
+
+        # ENHANCED: Validate symbol format
+        is_valid, error_msg = validate_symbol(symbol)
+        if not is_valid:
+            logger.warning(f"get_technical_snapshot_tool: {error_msg}")
+            return _json_fail("invalid_symbol", detail=error_msg)
+
+        # Validate days parameter
+        try:
+            days = int(args.get("days", 7) or 7)
+        except (TypeError, ValueError):
+            logger.warning("get_technical_snapshot_tool: invalid days parameter")
+            return _json_fail("invalid_days", detail="days must be a valid integer")
+
+        is_valid, error_msg = validate_integer(days, "days", min_val=1, max_val=365)
+        if not is_valid:
+            logger.warning(f"get_technical_snapshot_tool: {error_msg}")
+            return _json_fail("invalid_days", detail=error_msg)
 
         is_instrument_key = "|" in symbol
         logger.info("get_technical_snapshot_tool called: symbol=%s (is_key=%s) days=%s",
@@ -430,6 +874,9 @@ def get_technical_snapshot_tool(input_str=None, **kw) -> str:
         if cached and (now - cached[0] <= 25):
             logger.info("get_technical_snapshot_tool returning cached snapshot for %s", symbol)
             return _json_ok(symbol=symbol, snapshot=cached[1], cached=True)
+
+        # CRITICAL: Apply system-wide rate limiting before API call
+        _SYSTEM_RATE_LIMITER.wait_if_needed(f"technical_snapshot({symbol})")
 
         def _call():
             return TECH.snapshot(symbol, days=days)
@@ -457,7 +904,7 @@ def get_market_status_tool(input_str=None, **kw) -> str:
     Input: none (or {})
     """
     try:
-        res = OP.market_session_status()
+        res = get_operator_instance().market_session_status()
         logger.info("get_market_status_tool: %s", res)
         return _json_ok(market_session=res)
     except Exception as e:
@@ -472,7 +919,9 @@ def get_funds_tool(input_str=None, **kw) -> str:
     Input: none (or {})
     """
     try:
-        funds = OP.get_funds()
+        # CRITICAL: Apply system-wide rate limiting before broker API call
+        _SYSTEM_RATE_LIMITER.wait_if_needed("get_funds")
+        funds = get_operator_instance().get_funds()
         logger.info(
             "get_funds_tool: available_margin=%s",
             (funds.get("equity") or {}).get("available_margin", 0)
@@ -492,7 +941,10 @@ def get_positions_tool(input_str=None, **kw) -> str:
     args = _coerce_args(input_str, **kw)
     include_closed = bool(args.get("include_closed", False))
     try:
-        pos = OP.get_positions(include_closed=include_closed) if "include_closed" in inspect.signature(OP.get_positions).parameters else OP.get_positions()
+        # CRITICAL: Apply system-wide rate limiting before broker API call
+        _SYSTEM_RATE_LIMITER.wait_if_needed("get_positions")
+        op = get_operator_instance()
+        pos = op.get_positions(include_closed=include_closed) if "include_closed" in inspect.signature(op.get_positions).parameters else op.get_positions()
         count = len(pos.get("positions") or []) if isinstance(pos, dict) else None
         logger.info("get_positions_tool: include_closed=%s count=%s", include_closed, count)
         return _json_ok(positions=pos)
@@ -507,7 +959,7 @@ def get_holdings_tool(input_str=None, **kw) -> str:
     Fetch delivery holdings for swing management and mark-to-market.
     """
     try:
-        holds = OP.get_holdings()
+        holds = get_operator_instance().get_holdings()
         count = len(holds.get("holdings") or []) if isinstance(holds, dict) else None
         logger.info("get_holdings_tool: count=%s", count)
         return _json_ok(holdings=holds)
@@ -522,12 +974,13 @@ def get_portfolio_summary_tool(input_str=None, **kw) -> str:
     One-call overview for funds, positions, and holdings.
     """
     try:
-        if hasattr(OP, "get_portfolio_summary"):
-            summ = OP.get_portfolio_summary()
+        op = get_operator_instance()
+        if hasattr(op, "get_portfolio_summary"):
+            summ = op.get_portfolio_summary()
         else:
-            funds = OP.get_funds()
-            positions = OP.get_positions()
-            holdings = OP.get_holdings()
+            funds = op.get_funds()
+            positions = op.get_positions()
+            holdings = op.get_holdings()
             summ = {"funds": funds, "positions": positions, "holdings": holdings}
         logger.info("get_portfolio_summary_tool called")
         return _json_ok(summary=summ)
@@ -548,8 +1001,9 @@ def calculate_margin_tool(input_str=None, **kw) -> str:
             "calculate_margin_tool called: symbol=%s qty=%s price=%s product=%s",
             p.get("symbol"), p.get("qty"), p.get("price"), p.get("product")
         )
-        if hasattr(OP, "calculate_required_margin"):
-            m = OP.calculate_required_margin(**p)
+        op = get_operator_instance()
+        if hasattr(op, "calculate_required_margin"):
+            m = op.calculate_required_margin(**p)
             return _json_ok(margin=m)
         return _json_fail("operator_missing_calculate_required_margin")
     except Exception as e:
@@ -604,14 +1058,15 @@ def calculate_max_quantity_tool(input_str=None, **kw) -> str:
 
         funds = {}
         try:
-            funds = OP.get_funds() or {}
+            funds = get_operator_instance().get_funds() or {}
         except Exception as e_f:
             logger.warning("calculate_max_quantity_tool: get_funds failed: %s", e_f)
             funds = {}
         available = _extract_available_margin(funds)
 
-        if hasattr(OP, "calculate_max_quantity"):
-            fn = getattr(OP, "calculate_max_quantity")
+        op = get_operator_instance()
+        if hasattr(op, "calculate_max_quantity"):
+            fn = getattr(op, "calculate_max_quantity")
             sig = inspect.signature(fn)
             forward = {}
             if "symbol" in sig.parameters: forward["symbol"] = symbol
@@ -718,6 +1173,36 @@ def place_order_tool(input_str=None, **kw) -> str:
         p.get("target"), p.get("target_pct")
     )
 
+    # CRITICAL: Risk validation on order parameters (MUST happen before placing order!)
+    qty = p.get("qty")
+    price = p.get("price", 0)
+    symbol = p.get("symbol", "UNKNOWN")
+
+    # Validate quantity
+    if qty is None or qty <= 0:
+        logger.error(f"❌ RISK CHECK FAILED: Invalid quantity {qty} for {symbol}")
+        return _json_fail("invalid_quantity", detail=f"Quantity must be positive, got {qty}")
+
+    # Maximum quantity sanity check (configurable via env var)
+    MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
+    if qty > MAX_QTY_PER_ORDER:
+        logger.error(f"❌ RISK CHECK FAILED: Quantity {qty} exceeds max {MAX_QTY_PER_ORDER} for {symbol}")
+        return _json_fail("quantity_exceeds_max", detail=f"Quantity {qty} exceeds maximum {MAX_QTY_PER_ORDER} per order")
+
+    # Maximum order value sanity check (for LIMIT orders)
+    if price and price > 0:
+        order_value = qty * price
+        MAX_ORDER_VALUE = float(os.environ.get("MAX_ORDER_VALUE", "1000000"))  # Default: ₹10 lakh
+        if order_value > MAX_ORDER_VALUE:
+            logger.error(f"❌ RISK CHECK FAILED: Order value ₹{order_value:.2f} exceeds max ₹{MAX_ORDER_VALUE:.2f} for {symbol}")
+            return _json_fail("order_value_exceeds_max", detail=f"Order value ₹{order_value:.2f} exceeds maximum ₹{MAX_ORDER_VALUE:.2f}")
+
+        # Price sanity check (prevent absurdly high prices)
+        MAX_PRICE_PER_SHARE = float(os.environ.get("MAX_PRICE_PER_SHARE", "100000"))  # Default: ₹1 lakh/share
+        if price > MAX_PRICE_PER_SHARE:
+            logger.error(f"❌ RISK CHECK FAILED: Price ₹{price} exceeds max ₹{MAX_PRICE_PER_SHARE} for {symbol}")
+            return _json_fail("price_exceeds_max", detail=f"Price ₹{price} exceeds maximum ₹{MAX_PRICE_PER_SHARE} per share")
+
     # IMPORTANT: Log warning if live=False to make paper trading explicit
     if not p.get("live"):
         logger.warning(
@@ -732,8 +1217,11 @@ def place_order_tool(input_str=None, **kw) -> str:
         )
         print(f"🔴 LIVE ORDER: {p.get('symbol')} order WILL BE EXECUTED on Upstox (live=True)")
 
+    # CRITICAL: Apply system-wide rate limiting before broker API call
+    _SYSTEM_RATE_LIMITER.wait_if_needed(f"place_order({symbol})")
+
     try:
-        res = OP.place_order(**p)
+        res = get_operator_instance().place_order(**p)
 
         # If operator returned an error dict, surface as failure
         if isinstance(res, dict) and res.get("error"):
@@ -804,8 +1292,20 @@ def place_intraday_bracket_tool(input_str=None, **kw) -> str:
         p.get("auto_size")
     )
 
+    # CRITICAL: Risk validation on order parameters (same as place_order_tool)
+    qty = p.get("qty")
+    if qty is not None:  # auto_size might not have qty
+        if qty <= 0:
+            logger.error(f"❌ RISK CHECK FAILED: Invalid quantity {qty} for {symbol}")
+            return _json_fail("invalid_quantity", detail=f"Quantity must be positive, got {qty}")
+
+        MAX_QTY_PER_ORDER = int(os.environ.get("MAX_QTY_PER_ORDER", "10000"))
+        if qty > MAX_QTY_PER_ORDER:
+            logger.error(f"❌ RISK CHECK FAILED: Quantity {qty} exceeds max {MAX_QTY_PER_ORDER} for {symbol}")
+            return _json_fail("quantity_exceeds_max", detail=f"Quantity {qty} exceeds maximum {MAX_QTY_PER_ORDER} per order")
+
     try:
-        res = OP.place_order(**p)
+        res = get_operator_instance().place_order(**p)
 
         if isinstance(res, dict) and res.get("error"):
             logger.error("place_intraday_bracket_tool: operator error response: %s", res)
@@ -833,14 +1333,15 @@ def square_off_tool(input_str=None, **kw) -> str:
     p = _coerce_args(input_str, **kw)
     try:
         logger.info("square_off_tool called: %s", {k: p.get(k) for k in ("symbol", "instrument_key", "live")})
-        if "instrument_key" in inspect.signature(OP.square_off).parameters:
-            res = OP.square_off(**p)
+        op = get_operator_instance()
+        if "instrument_key" in inspect.signature(op.square_off).parameters:
+            res = op.square_off(**p)
         else:
             # fallback name if your operator uses a different function
-            if hasattr(OP, "square_off_symbol"):
-                res = OP.square_off_symbol(**p)
+            if hasattr(op, "square_off_symbol"):
+                res = op.square_off_symbol(**p)
             else:
-                res = OP.square_off(**p)  # let it raise if truly unavailable
+                res = op.square_off(**p)  # let it raise if truly unavailable
         logger.info("square_off_tool result: %s", res)
         return _json_ok(result=res)
     except Exception as e:
