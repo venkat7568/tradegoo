@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 main.py — Trading UI with robust rendering & SSE
@@ -8,10 +8,15 @@ main.py — Trading UI with robust rendering & SSE
 """
 
 import os
+import sys
 import json
 import time
 import queue
 import threading
+import logging
+import logging.handlers
+import signal
+import atexit
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -93,9 +98,6 @@ validate_environment_variables()
 
 # Local modules
 from trading_crew import TradingCrew
-import logging
-import logging.handlers
-import sys
 
 # ============================================================================
 # LOGGING CONFIGURATION - Comprehensive logging to console + file
@@ -222,8 +224,6 @@ MAX_DISCOVERED_SYMBOLS = int(os.environ.get("MAX_DISCOVERED_SYMBOLS", "20"))
 # ============================================================================
 # GRACEFUL SHUTDOWN HANDLING
 # ============================================================================
-import signal
-import atexit
 
 _shutdown_handlers = []
 
