@@ -17,9 +17,11 @@ EXTRA:
 from __future__ import annotations
 
 import os
+import re
 import json
 import math
 import time
+import random
 import inspect
 import logging
 import threading
@@ -560,7 +562,6 @@ def _retry(plan_ms, fn):
             # Apply sleep with jitter for exponential backoff
             if ms:
                 # Add 10% jitter to prevent thundering herd
-                import random
                 jitter = random.uniform(0.9, 1.1)
                 actual_sleep = (ms / 1000.0) * jitter
                 time.sleep(actual_sleep)
@@ -601,7 +602,6 @@ def validate_symbol(symbol: str) -> tuple[bool, str]:
         return False, f"Symbol too long ({len(symbol)} chars, max 50)"
 
     # Allow alphanumeric, hyphens, underscores, pipes (for instrument keys)
-    import re
     if not re.match(r'^[A-Za-z0-9_\-|]+$', symbol):
         return False, "Symbol contains invalid characters"
 
@@ -766,16 +766,13 @@ def search_news_tool(input_str=None, **kw) -> str:
             return _json_fail("missing_query")
 
         # SECURITY: Input sanitization to prevent injection attacks
-        # Remove potentially dangerous characters
-        import re
-        # Allow only alphanumeric, spaces, and basic punctuation
+        # Remove potentially dangerous characters (allow only alphanumeric, spaces, basic punctuation)
         q = re.sub(r'[^\w\s\-\.,:;\'\"&()]+', '', q)
 
         # Limit query length to prevent abuse
-        MAX_QUERY_LENGTH = int(os.environ.get("MAX_NEWS_QUERY_LENGTH", "200"))
-        if len(q) > MAX_QUERY_LENGTH:
-            logger.warning(f"search_news_tool: query truncated from {len(q)} to {MAX_QUERY_LENGTH} chars")
-            q = q[:MAX_QUERY_LENGTH]
+        if len(q) > Config.MAX_NEWS_QUERY_LENGTH:
+            logger.warning(f"search_news_tool: query truncated from {len(q)} to {Config.MAX_NEWS_QUERY_LENGTH} chars")
+            q = q[:Config.MAX_NEWS_QUERY_LENGTH]
 
         if not q:  # Check again after sanitization
             logger.warning("search_news_tool: query empty after sanitization")
